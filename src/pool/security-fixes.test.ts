@@ -12,6 +12,7 @@ import type { TestContext } from "node:test";
 
 import { classify, MAX_TRANSIENT_ATTEMPTS } from "./classifier.js";
 import { isCredentialRejected } from "./manager.js";
+import { clipFrame } from "./tui.js";
 import { createRotationStateStore } from "./rotation-state.js";
 
 const NOW = 1_000_000;
@@ -150,5 +151,82 @@ describe("audit H1: stale lock reclaim requires a dead holder", () => {
 
     assert.equal(entered, true);
     assert.equal(fs.existsSync(`${statePath}.lock`), false);
+  });
+});
+
+describe("pool bug sweep regressions (2026-09)", () => {
+  it("does not treat a status outside our own prefix as a credential rejection", () => {
+    // A gateway body or a network error can contain "(403)"/"(401)". Treating
+    // those as rejections permanently disabled healthy accounts, and undoing a
+    // disable needs manual operator action.
+    assert.equal(
+      isCredentialRejected("Token refresh failed (502): <html>Error (403) Forbidden</html>"),
+      false,
+    );
+    assert.equal(
+      isCredentialRejected("Token refresh failed: ETIMEDOUT after (401) retries logged"),
+      false,
+    );
+    assert.equal(isCredentialRejected("Token refresh failed (503): upstream busy"), false);
+  });
+
+  it("still catches genuine credential rejections", () => {
+    assert.equal(isCredentialRejected("Token refresh failed (400): invalid_grant"), true);
+    assert.equal(isCredentialRejected("Token refresh failed (401): token revoked"), true);
+    assert.equal(isCredentialRejected("provider said invalid_grant"), true);
+  });
+});
+
+describe("TUI frame clipping", () => {
+  it("never emits a line that reaches the terminal width", () => {
+    // A line of exactly `columns` characters wraps, so the frame drifts and the
+    // previous frame bleeds through — it rendered as duplicated footers and
+    // merged text. Enforced at the write point so no caller can reintroduce it.
+    const visible = (line: string): number =>
+      line.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").length;
+    const frame = [`${"a".repeat(200)}`, `short`, `${"b".repeat(80)}`].join("\n");
+    for (const line of clipFrame(frame, 61).split("\n")) {
+      assert.ok(visible(line) <= 61, `line too wide: ${visible(line)}`);
+    }
+  });
+
+  it("emits exactly one line per terminal row so a shorter frame leaves no tail", () => {
+    // Frames change height (expanding a detail pane, a message appearing).
+    // Relying on erase-to-end-of-screen left the tail of a taller previous
+    // frame on screen, which read as a duplicated footer and stale text merged
+    // into the detail pane.
+    const tall = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n");
+    const short = "only one line";
+    for (const frame of [tall, short]) {
+      const outLines = clipFrame(frame, 40, 8).replace(/\n$/, "").split("\n");
+      assert.equal(outLines.length, 8, "frame height must be constant");
+    }
+    // Padding rows must carry the erase code, not just be blank.
+    assert.ok(clipFrame(short, 40, 4).includes("\u001b[K"));
+  });
+
+  it("appends the erase code to every line regardless of call site", () => {
+    // Requiring each out.push to append EOL was fragile: two detail-pane
+    // templates contained nested backticks, a bulk edit silently skipped them,
+    // and those lines then displayed fragments of the longer content they
+    // overwrote. Centralising it makes the omission impossible.
+    const frame = ["\u001b[2m  5h —  7d —\u001b[0m", "plain", "already\u001b[K"].join("\n");
+    const lines = clipFrame(frame, 80, 5).replace(/\n$/, "").split("\n");
+    assert.ok(
+      lines.every((line) => line.endsWith("\u001b[K")),
+      "every line must erase its own tail",
+    );
+    assert.ok(
+      !lines.some((line) => line.endsWith("\u001b[K\u001b[K")),
+      "must not double up an existing erase code",
+    );
+  });
+
+  it("preserves escape sequences when clipping", () => {
+    const line = `\u001b[2m${"x".repeat(100)}\u001b[0m\u001b[K`;
+    const out = clipFrame(line, 10);
+    assert.ok(out.includes("\u001b[2m"), "leading style dropped");
+    assert.ok(out.includes("\u001b[K"), "erase-to-EOL dropped");
+    assert.equal(out.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").length, 10);
   });
 });
