@@ -42,6 +42,42 @@ function decodeDumpValue(value: string): string | null {
   }
 }
 
+/**
+ * Decode the hex form `dump-keychain` uses when a value is not printable-ASCII
+ * safe, e.g. `0x796100  "ya\000"`. Matching only the quoted form made such
+ * items invisible to {@link parseKeychainLabels}, which silently dropped the
+ * account: never selected, then disabled as "credentials missing".
+ */
+function decodeDumpHex(hex: string): string | null {
+  if (hex.length === 0 || hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    return null;
+  }
+  try {
+    const text = Buffer.from(hex, "hex").toString("utf8");
+    // A lone replacement char means the bytes were not valid UTF-8, so the
+    // decode is untrustworthy and a wrong label is worse than none.
+    return text.includes("\uFFFD") ? null : text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read one `"<name>"<blob>=` attribute, accepting both emitted forms.
+ * The hex form may be followed by an escaped rendering, which is ignored.
+ */
+function readDumpAttribute(block: string, name: string): string | null {
+  const quoted = block.match(
+    new RegExp(`^\\s*"${name}"<blob>=("(?:[^"\\\\]|\\\\.)*")\\s*$`, "m"),
+  );
+  if (quoted) return decodeDumpValue(quoted[1]);
+
+  const hex = block.match(new RegExp(`^\\s*"${name}"<blob>=0x([0-9a-fA-F]+)`, "m"));
+  if (hex) return decodeDumpHex(hex[1]);
+
+  return null;
+}
+
 function parseKeychainLabels(output: string, service: string): string[] {
   const labels = new Set<string>();
 
@@ -49,12 +85,8 @@ function parseKeychainLabels(output: string, service: string): string[] {
   // attributes are lines such as `"svce"<blob>="..."` and
   // `"acct"<blob>="..."`; matching by attribute name avoids depending on order.
   for (const block of output.split(/(?=^keychain:)/m)) {
-    const serviceMatch = block.match(/^\s*"svce"<blob>=("(?:[^"\\]|\\.)*")\s*$/m);
-    const accountMatch = block.match(/^\s*"acct"<blob>=("(?:[^"\\]|\\.)*")\s*$/m);
-    if (!serviceMatch || !accountMatch) continue;
-
-    const itemService = decodeDumpValue(serviceMatch[1]);
-    const account = decodeDumpValue(accountMatch[1]);
+    const itemService = readDumpAttribute(block, "svce");
+    const account = readDumpAttribute(block, "acct");
     if (itemService === service && account !== null) labels.add(account);
   }
 
