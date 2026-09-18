@@ -24,6 +24,8 @@ import {
   DEFAULT_EFFORT,
   CLEAR_THINKING_TYPE,
   SESSION_ID,
+  POOL_TOAST_DURATION_MS,
+  POOL_DASHBOARD_TOAST_DURATION_MS,
 } from "./constants.js";
 import {
   getClaudeTools,
@@ -160,6 +162,18 @@ type PluginClient = {
       path: { id: string };
       body: Record<string, unknown>;
     }) => Promise<void>;
+  };
+  /** Present on opencode hosts that expose the TUI control API. */
+  tui?: {
+    showToast?: (args: {
+      body: {
+        title?: string;
+        message: string;
+        variant: "info" | "success" | "warning" | "error";
+        duration?: number;
+      };
+    }) => Promise<unknown>;
+    clearPrompt?: () => Promise<unknown>;
   };
 };
 
@@ -631,7 +645,35 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     }
   } catch {}
 
+  /**
+   * Surface pool exhaustion in the TUI as well as in the response body.
+   *
+   * The 429 body still carries the detail (some hosts have no TUI), but a chat
+   * error is easy to miss mid-session, so the same message is also raised as a
+   * toast. Best-effort: a host without the TUI control API must not break the
+   * request path, so every failure here is swallowed.
+   */
+  const notifyExhausted = async (message: string): Promise<void> => {
+    try {
+      await client.tui?.showToast?.({
+        body: {
+          title: "Claude pool exhausted",
+          message,
+          variant: "warning",
+          duration: POOL_TOAST_DURATION_MS,
+        },
+      });
+    } catch {
+      /* toast is advisory only */
+    }
+  };
+
   return {
+    /**
+     * Register `/claude-pool`. Commands are prompt templates rather than
+     * functions, so the template instructs the agent to call the status tool
+     * and echo it verbatim; the tool itself does the work.
+     */
     "experimental.chat.system.transform": (
       input: { model?: { providerID: string } },
       output: { system: string[] },
@@ -714,6 +756,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
                 console.error(`[claude-pool] ${message}`);
+                await notifyExhausted(message);
                 return buildPoolExhaustedResponse(
                   message,
                   acquired.info.earliestReset,
@@ -1012,6 +1055,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 if (next.kind === "exhausted") {
                   const message = pool.describeExhaustion(next.info);
                   console.error(`[claude-pool] ${message}`);
+                  await notifyExhausted(message);
                   return buildPoolExhaustedResponse(
                     message,
                     next.info.earliestReset,

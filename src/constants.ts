@@ -103,3 +103,44 @@ export const SESSION_ID =
   process.env.ANTHROPIC_SESSION_ID || "";
 
 export const TOOL_PREFIX = "mcp_";
+
+/**
+ * How long the pool-exhaustion toast stays on screen.
+ *
+ * Long enough to read the per-account recovery times, short enough that it
+ * clears itself if the user steps away. Toast dismissal-on-click is handled by
+ * opencode's TUI, not by this plugin.
+ */
+export const POOL_TOAST_DURATION_MS = 10_000;
+
+/** Slash-command name for the pool dashboard. */
+export const POOL_COMMAND_NAME = "claude-pool";
+
+/**
+ * Template for {@link POOL_COMMAND_NAME}.
+ *
+ * The !`...` form is expanded by opencode itself: it runs the command and
+ * substitutes stdout before the prompt is built, so the dashboard is produced
+ * by a function. The trailing instruction exists because opencode's command
+ * path ALWAYS prompts a model (verified in the binary: `command.execute.before`
+ * cannot cancel it), so the cheapest correct behaviour is a model that prints
+ * the block and stops.
+ */
+export const POOL_COMMAND_TEMPLATE = [
+  "!`node " +
+    "$HOME/src/opencode-claude-bridge/scripts/claude-pool.mjs dashboard`",
+  "",
+  "Output the block above verbatim inside a fenced code block. " +
+    "Add no commentary, summary, or follow-up question.",
+].join("\n");
+
+/** Free model for the dashboard turn, so rendering status costs nothing. */
+export const POOL_COMMAND_MODEL = "opencode/big-pickle";
+
+/**
+ * How long the /claude-pool dashboard toast stays up.
+ *
+ * Longer than the exhaustion warning because the dashboard is the command's
+ * ONLY output — there is no transcript copy to scroll back to.
+ */
+export const POOL_DASHBOARD_TOAST_DURATION_MS = 30_000;
