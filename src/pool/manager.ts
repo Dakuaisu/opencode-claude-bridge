@@ -49,8 +49,16 @@ import type {
 
 export type AccountStore = ReturnType<typeof createAccountStore>;
 
-/** Refresh a token pair. Sync, mirroring oauth.ts's curl-based refreshTokens. */
-export type RefreshFn = (refreshToken: string) => PoolOAuthTokens;
+/**
+ * Refresh a token pair.
+ *
+ * May be sync (oauth.ts's execFileSync-based `refreshTokens`) or async. The
+ * async form is preferred: a synchronous refresh blocks the event loop for the
+ * whole round trip, stalling the opencode session that is waiting on it.
+ */
+export type RefreshFn = (
+  refreshToken: string,
+) => PoolOAuthTokens | Promise<PoolOAuthTokens>;
 
 /** Mirror the active account into opencode's single `anthropic` auth slot. */
 export type MirrorFn = (tokens: PoolOAuthTokens) => Promise<void>;
@@ -91,9 +99,15 @@ export const TRANSIENT_REFRESH_COOLDOWN_MS = 60_000;
  * so both the HTTP status and the OAuth error code are available in the text.
  */
 export function isCredentialRejected(detail: string): boolean {
-  return /invalid_grant|invalid_client|unauthorized_client|access_denied|\((?:400|401|403)\)/i.test(
-    detail,
-  );
+  // OAuth error codes are unambiguous wherever they appear.
+  if (/\b(?:invalid_grant|invalid_client|unauthorized_client|access_denied)\b/i.test(detail)) {
+    return true;
+  }
+  // A bare status must come from OUR message prefix, not from anywhere in the
+  // text. Matching loosely meant a gateway body containing "(403)" — or an
+  // incidental "(401)" in a network error — permanently disabled a healthy
+  // account, and disabling requires manual operator action to undo.
+  return /^Token refresh failed \((?:400|401|403)\)/i.test(detail.trim());
 }
 
 export function defaultJournalPath(): string {
@@ -186,9 +200,14 @@ export function createRotationManager(opts: ManagerOptions) {
    * because the server already invalidated their predecessors — would be lost.
    */
   async function replayJournal(): Promise<boolean> {
-    const entry = readJournal();
-    if (!entry) return false;
+    // Cheap pre-check so the common case (no journal) costs no lock.
+    if (!readJournal()) return false;
     try {
+      // Re-read INSIDE the lock: a concurrent process may have replayed and
+      // cleared it while we waited. These are irreplaceable refresh tokens, so
+      // this path gets the same serialisation as minting them.
+      const entry = await state.withLock(async () => readJournal());
+      if (!entry) return false;
       await accounts.updateTokens(entry.label, entry.tokens);
       clearJournal();
       console.error(
@@ -197,7 +216,7 @@ export function createRotationManager(opts: ManagerOptions) {
       return true;
     } catch (err) {
       console.error(
-        `[claude-pool] failed to replay refresh journal for "${entry.label}": ${
+        `[claude-pool] failed to replay refresh journal: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -249,7 +268,7 @@ export function createRotationManager(opts: ManagerOptions) {
         if (!current) throw new Error(`Account "${label}" is not enrolled`);
         if (isFresh(current.oauth, clock())) return current.oauth;
 
-        const fresh = refreshFn(current.oauth.refresh);
+        const fresh = await refreshFn(current.oauth.refresh);
 
         // Journal BEFORE committing: the server has already invalidated the
         // old refresh token, so these are now the only usable credentials.
@@ -354,6 +373,7 @@ export function createRotationManager(opts: ManagerOptions) {
           label,
           decision.until ?? clock(),
           decision.reason,
+          decision.windows,
         );
         await state.setActive(null);
         break;
@@ -367,9 +387,61 @@ export function createRotationManager(opts: ManagerOptions) {
     }
   }
 
+  /**
+   * Read-only view of every enrolled account for the dashboard. Deliberately
+   * returns no secret material — only the token EXPIRY, never the token.
+   */
+  async function snapshot(): Promise<PoolSnapshot> {
+    await sync();
+    const now = clock();
+    const rotation = state.load();
+    const records = await accounts.listAccounts();
+    const rows: PoolSnapshotRow[] = records.map((record) => {
+      const account = rotation.accounts[record.label];
+      const cooling =
+        account?.cooldownUntil !== null &&
+        account?.cooldownUntil !== undefined &&
+        account.cooldownUntil > now;
+      return {
+        label: record.label,
+        email: record.email ?? null,
+        tier: record.subscriptionType ?? null,
+        status: account?.disabled ? "disabled" : cooling ? "cooling" : "ready",
+        cooldownUntil: cooling ? (account!.cooldownUntil as number) : null,
+        reason: account?.lastReason ?? null,
+        failureCount: account?.failureCount ?? 0,
+        tokenExpires: record.oauth.expires,
+        active: rotation.activeLabel === record.label,
+        fiveHourReset: account?.fiveHourReset ?? null,
+        sevenDayReset: account?.sevenDayReset ?? null,
+        bindingWindow: account?.bindingWindow ?? null,
+        scopes: record.scopes ?? null,
+        rateLimitTier: record.rateLimitTier ?? null,
+        enrolledAt: record.enrolledAt,
+        updatedAt: account?.updatedAt ?? null,
+      };
+    });
+    rows.sort((left, right) => {
+      const rank = { ready: 0, cooling: 1, disabled: 2 } as const;
+      return rank[left.status] - rank[right.status] || (left.label < right.label ? -1 : 1);
+    });
+    return { activeLabel: rotation.activeLabel, now, accounts: rows };
+  }
+
+  /**
+   * True when a refresh journal is present, i.e. a previous process died
+   * between minting new tokens and persisting them. Surfaced so the recovery
+   * path is visible rather than silent.
+   */
+  function pendingRefreshLabel(): string | null {
+    return readJournal()?.label ?? null;
+  }
+
   return {
     isActive,
     sync,
+    snapshot,
+    pendingRefreshLabel,
     acquire,
     refreshLabel,
     applyDecision,
@@ -401,6 +473,31 @@ export function createRotationManager(opts: ManagerOptions) {
       return describeExhaustion(info, clock());
     },
   };
+}
+
+export interface PoolSnapshotRow {
+  label: string;
+  email: string | null;
+  tier: string | null;
+  status: "ready" | "cooling" | "disabled";
+  cooldownUntil: number | null;
+  reason: string | null;
+  failureCount: number;
+  tokenExpires: number;
+  active: boolean;
+  fiveHourReset: number | null;
+  sevenDayReset: number | null;
+  bindingWindow: "five_hour" | "seven_day" | null;
+  scopes: string[] | null;
+  rateLimitTier: string | null;
+  enrolledAt: number;
+  updatedAt: number | null;
+}
+
+export interface PoolSnapshot {
+  activeLabel: string | null;
+  now: number;
+  accounts: PoolSnapshotRow[];
 }
 
 export type RotationManager = ReturnType<typeof createRotationManager>;
