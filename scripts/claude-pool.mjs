@@ -80,9 +80,9 @@ async function enroll(label, flags = []) {
   // Fresh credentials mean any prior disable/cooldown is stale. Without this,
   // re-enrolling a revoked account reports success while rotation keeps
   // skipping it.
-  await state.resetHealth(label);
+  await state.resetHealth(record.label);
   console.log(
-    `Enrolled "${label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
+    `Enrolled "${record.label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
   );
   const total = (await accounts.listAccounts()).length;
   console.log(`Pool now holds ${total} account${total === 1 ? "" : "s"}.`);
@@ -184,11 +184,15 @@ async function status() {
 
 async function remove(label) {
   if (!label) throw new Error("usage: claude-pool remove <label>");
+  const inKeychain = (await accounts.getAccount(label)) !== null;
+  const inState = Object.hasOwn(state.load().accounts, label);
+  if (!inKeychain && !inState) {
+    const known = (await accounts.listAccounts()).map((a) => a.label);
+    console.error(`No account named "${label}". Enrolled: ${known.join(", ") || "none"}`);
+    process.exit(1);
+  }
   await accounts.removeAccount(label);
-  await state.withLock((s) => {
-    delete s.accounts[label];
-    if (s.activeLabel === label) s.activeLabel = null;
-  });
+  await state.forget(label);
   console.log(`Removed "${label}".`);
 }
 
@@ -232,6 +236,7 @@ async function dashboard() {
     state,
     enroll: async (label) => {
       const record = await enrollFromClaudeCli({ accounts, label, resolveEmail: true });
+      await state.resetHealth(record.label);
       return record.label;
     },
     fetchUsage: async (label, allowRefresh) => {
