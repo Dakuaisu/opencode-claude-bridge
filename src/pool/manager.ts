@@ -52,9 +52,8 @@ export type AccountStore = ReturnType<typeof createAccountStore>;
 /**
  * Refresh a token pair.
  *
- * May be sync (oauth.ts's execFileSync-based `refreshTokens`) or async. The
- * async form is preferred: a synchronous refresh blocks the event loop for the
- * whole round trip, stalling the opencode session that is waiting on it.
+ * May be sync or async. Prefer async: a synchronous refresh blocks the event
+ * loop for the whole round trip, stalling every session in the process.
  */
 export type RefreshFn = (
   refreshToken: string,
@@ -120,35 +119,28 @@ export function defaultJournalPath(): string {
   );
 }
 
-/** Human-readable fail-fast message naming who is cold and when they return. */
+/**
+ * One-line fail-fast message.
+ *
+ * Deliberately terse: opencode renders session errors as a 5-second toast over
+ * the prompt area, with the duration hardcoded at its call site, so a
+ * multi-sentence message is unreadable before it vanishes. The per-account
+ * breakdown lives in `claude-pool dashboard`, which is where someone can
+ * actually study it.
+ */
 export function describeExhaustion(info: ExhaustionInfo, now: number): string {
-  const parts: string[] = ["All Claude accounts in the pool are unavailable."];
-
-  if (info.cooling.length > 0) {
-    const list = info.cooling
-      .map((c) => {
-        const mins = Math.max(0, Math.ceil((c.until - now) / 60_000));
-        return `${c.label} (available in ~${mins}m, at ${new Date(c.until).toISOString()})`;
-      })
-      .join(", ");
-    parts.push(`Cooling down: ${list}.`);
-  }
-
-  if (info.disabled.length > 0) {
-    parts.push(
-      `Disabled (needs re-authentication): ${info.disabled.join(", ")}.`,
-    );
-  }
-
   if (info.earliestReset !== null) {
-    parts.push(
-      `Earliest availability: ${new Date(info.earliestReset).toISOString()}.`,
+    const soonest = info.cooling.reduce<{ label: string; until: number } | null>(
+      (best, candidate) => (best === null || candidate.until < best.until ? candidate : best),
+      null,
     );
-  } else {
-    parts.push("No account will recover automatically; re-enroll or re-login.");
+    const mins = Math.max(0, Math.ceil((info.earliestReset - now) / 60_000));
+    const when = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h`;
+    const who = soonest ? ` (${soonest.label})` : "";
+    return `Claude pool exhausted — next account free in ${when}${who}`;
   }
-
-  return parts.join(" ");
+  const count = info.disabled.length;
+  return `Claude pool exhausted — ${count} account${count === 1 ? "" : "s"} disabled; re-enroll or re-login`;
 }
 
 export function createRotationManager(opts: ManagerOptions) {
@@ -199,21 +191,23 @@ export function createRotationManager(opts: ManagerOptions) {
    * before persisting. Without this, those tokens — the only valid ones,
    * because the server already invalidated their predecessors — would be lost.
    */
+  // Caller must hold the lock, or another process can spend the dead keychain token.
+  async function commitPendingJournalLocked(): Promise<JournalEntry | null> {
+    const entry = readJournal();
+    if (!entry) return null;
+    await accounts.updateTokens(entry.label, entry.tokens);
+    clearJournal();
+    console.error(
+      `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
+    );
+    return entry;
+  }
+
   async function replayJournal(): Promise<boolean> {
     // Cheap pre-check so the common case (no journal) costs no lock.
     if (!readJournal()) return false;
     try {
-      // Re-read INSIDE the lock: a concurrent process may have replayed and
-      // cleared it while we waited. These are irreplaceable refresh tokens, so
-      // this path gets the same serialisation as minting them.
-      const entry = await state.withLock(async () => readJournal());
-      if (!entry) return false;
-      await accounts.updateTokens(entry.label, entry.tokens);
-      clearJournal();
-      console.error(
-        `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
-      );
-      return true;
+      return (await state.withLock(commitPendingJournalLocked)) !== null;
     } catch (err) {
       console.error(
         `[claude-pool] failed to replay refresh journal: ${
@@ -262,6 +256,8 @@ export function createRotationManager(opts: ManagerOptions) {
 
     const task = (async (): Promise<PoolOAuthTokens> => {
       return state.withLock(async () => {
+        // The TUI calls this directly, skipping acquire()'s journal replay.
+        await commitPendingJournalLocked();
         // Another process may have refreshed while we waited for the lock.
         // Re-read inside the critical section before burning our token.
         const current = await accounts.getAccount(label);
@@ -298,12 +294,12 @@ export function createRotationManager(opts: ManagerOptions) {
    * Returns `exhausted` (never throws) when every account is cold, so the
    * caller can fail fast with a precise, actionable message.
    */
-  async function acquire(): Promise<AcquireResult> {
+  async function acquire(exclude?: ReadonlySet<string>): Promise<AcquireResult> {
     await replayJournal();
     await sync();
 
     const now = clock();
-    const selection = selectNext(state.load(), now);
+    const selection = selectNext(state.load(), now, exclude);
     if (selection.kind === "exhausted") {
       return {
         kind: "exhausted",
@@ -316,12 +312,19 @@ export function createRotationManager(opts: ManagerOptions) {
     }
 
     const label = selection.label;
-    let record = await accounts.getAccount(label);
+    let record: AccountRecord | null;
+    try {
+      record = await accounts.getAccount(label);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await state.markCooldown(label, clock() + TRANSIENT_REFRESH_COOLDOWN_MS, detail);
+      return acquire(exclude);
+    }
     if (!record) {
       // Enrolled in state but missing from the keychain: disable rather than
       // spin, so selection moves on instead of picking it again.
       await state.markDisabled(label, "credentials missing from keychain");
-      return acquire();
+      return acquire(exclude);
     }
 
     if (!isFresh(record.oauth, now)) {
@@ -343,7 +346,7 @@ export function createRotationManager(opts: ManagerOptions) {
             `refresh failed: ${detail}`,
           );
         }
-        return acquire();
+        return acquire(exclude);
       }
     }
 
@@ -367,6 +370,11 @@ export function createRotationManager(opts: ManagerOptions) {
     label: string,
     decision: RotationDecision,
   ): Promise<void> {
+    // Deferred penalties land after the pool has switched; don't clear the new pick.
+    const releaseIfActive = () =>
+      state.withLock((s) => {
+        if (s.activeLabel === label) s.activeLabel = null;
+      });
     switch (decision.action) {
       case "ROTATE_COOLDOWN":
         await state.markCooldown(
@@ -375,11 +383,11 @@ export function createRotationManager(opts: ManagerOptions) {
           decision.reason,
           decision.windows,
         );
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "ROTATE_DISABLE":
         await state.markDisabled(label, decision.reason);
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "RETRY_SAME":
       case "PASS_THROUGH":

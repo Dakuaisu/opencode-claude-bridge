@@ -34,6 +34,32 @@ async function runSecurity(args: string[]): Promise<string> {
   return stdout;
 }
 
+// `security -i` writes a TRUNCATED secret for lines over 4095 chars, then fails.
+const SECURITY_MAX_LINE = 4000;
+
+function quoteForSecurity(value: string): string {
+  if (/["\\\r\n]/.test(value)) {
+    throw new Error(`Unsupported character in keychain name "${value}"`);
+  }
+  return `"${value}"`;
+}
+
+/** Runs one `security` command read from stdin, keeping secrets out of argv. */
+function runSecurityCommand(line: string): Promise<void> {
+  if (line.length > SECURITY_MAX_LINE) {
+    return Promise.reject(new Error("keychain command exceeds the safe line length"));
+  }
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "security",
+      ["-i"],
+      { timeout: SECURITY_TIMEOUT_MS, encoding: "utf8" },
+      (error) => (error ? reject(error) : resolve()),
+    );
+    child.stdin?.end(`${line}\n`);
+  });
+}
+
 function decodeDumpValue(value: string): string | null {
   try {
     return JSON.parse(value) as string;
@@ -99,7 +125,7 @@ export function createKeychainBackend(
   return {
     async get(label: string): Promise<string | null> {
       try {
-        return await runSecurity([
+        const output = await runSecurity([
           "find-generic-password",
           "-s",
           service,
@@ -107,27 +133,21 @@ export function createKeychainBackend(
           label,
           "-w",
         ]);
-      } catch {
-        return null;
+        return output.endsWith("\n") ? output.slice(0, -1) : output;
+      } catch (error) {
+        // A locked keychain or timeout is not "missing": missing gets an account disabled.
+        if (isMissingKeychainItem(error)) return null;
+        throw new Error(`Failed to read keychain account "${label}"`);
       }
     },
 
     async set(label: string, value: string): Promise<void> {
       try {
-        await runSecurity([
-          "add-generic-password",
-          "-U",
-          "-s",
-          service,
-          "-a",
-          label,
-          "-l",
-          `${service}:${label}`,
-          "-D",
-          "Claude account pool entry",
-          "-w",
-          value,
-        ]);
+        const hex = Buffer.from(value, "utf8").toString("hex");
+        await runSecurityCommand(
+          `add-generic-password -U -s ${quoteForSecurity(service)} -a ${quoteForSecurity(label)}`
+            + ` -l ${quoteForSecurity(`${service}:${label}`)} -D "Claude account pool entry" -X ${hex}`,
+        );
       } catch {
         throw new Error(`Failed to store keychain account "${label}"`);
       }
@@ -327,8 +347,12 @@ export function createAccountStore(backend: SecretBackend) {
     async listAccounts(): Promise<AccountRecord[]> {
       const accounts: AccountRecord[] = [];
       for (const label of await backend.list()) {
-        const account = await getAccount(label);
-        if (account !== null) accounts.push(account);
+        try {
+          const account = await getAccount(label);
+          if (account !== null) accounts.push(account);
+        } catch (error) {
+          console.error(`[claude-pool] skipping "${label}": ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return accounts;
     },

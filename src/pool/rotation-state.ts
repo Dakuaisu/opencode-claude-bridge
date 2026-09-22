@@ -49,6 +49,7 @@ export function defaultRotationState(): RotationState {
 }
 
 export function defaultStatePath(): string {
+  if (process.env.CLAUDE_POOL_STATE_PATH) return process.env.CLAUDE_POOL_STATE_PATH;
   return path.join(
     os.homedir(),
     ".local",
@@ -397,6 +398,13 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
         account.updatedAt = now;
         // Observed quota windows are left intact: clearing local health does
         // not give the account its server-side quota back.
+      });
+    },
+
+    async forget(label: string): Promise<void> {
+      await withLock((state) => {
+        delete state.accounts[label];
+        if (state.activeLabel === label) state.activeLabel = null;
       });
     },
 

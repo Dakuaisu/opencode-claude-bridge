@@ -223,9 +223,14 @@ export function createPoolTui(deps: TuiDeps) {
   }
 
   async function reload(): Promise<void> {
-    snapshot = await deps.pool.snapshot();
+    const next = await deps.pool.snapshot();
+    // Rows re-sort by status, so the cursor follows the account, not the index.
+    const selectedLabel = selected()?.label;
+    snapshot = next;
     redundant = findRedundant(snapshot.accounts);
-    if (cursor >= snapshot.accounts.length) cursor = Math.max(0, snapshot.accounts.length - 1);
+    const kept = snapshot.accounts.findIndex((a) => a.label === selectedLabel);
+    if (kept !== -1) cursor = kept;
+    else if (cursor >= snapshot.accounts.length) cursor = Math.max(0, snapshot.accounts.length - 1);
   }
 
   function render(): void {
@@ -587,7 +592,10 @@ export function createPoolTui(deps: TuiDeps) {
           .map((a) => a.label)
           .join(", ")})?`,
         run: async () => {
-          for (const account of stale) await deps.accounts.removeAccount(account.label);
+          for (const account of stale) {
+            await deps.accounts.removeAccount(account.label);
+            await deps.state.forget(account.label);
+          }
           return `pruned ${stale.length} duplicate${stale.length === 1 ? "" : "s"}`;
         },
       };
@@ -625,6 +633,7 @@ export function createPoolTui(deps: TuiDeps) {
         prompt: `Remove "${target.label}" and delete its stored credentials?`,
         run: async () => {
           await deps.accounts.removeAccount(target.label);
+          await deps.state.forget(target.label);
           return `removed "${target.label}"`;
         },
       };

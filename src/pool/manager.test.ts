@@ -196,6 +196,24 @@ describe("rotation manager token acquisition", () => {
   });
 });
 
+describe("rotation manager keychain read failures", () => {
+  it("cools an account whose credentials cannot be read, instead of disabling it", async (t) => {
+    const h = harness(t, [record("alice"), record("bob")]);
+    const originalGet = h.accounts.getAccount.bind(h.accounts);
+    h.accounts.getAccount = async (label) => {
+      if (label === "alice") throw new Error('Failed to read keychain account "alice"');
+      return originalGet(label);
+    };
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind === "ok" && result.label, "bob");
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.disabled, false);
+    assert.ok((alice?.cooldownUntil ?? 0) > NOW);
+  });
+});
+
 describe("rotation manager journal replay", () => {
   it("commits a journal left behind by a crashed process", async (t) => {
     const h = harness(t, [record("alice")]);
@@ -225,9 +243,79 @@ describe("rotation manager journal replay", () => {
     const h = harness(t, [record("alice")]);
     assert.equal(await h.manager.replayJournal(), false);
   });
+
+  it("keeps the lock held until the replayed tokens are committed", async (t) => {
+    const h = harness(t, [record("alice")]);
+    writePendingJournal(h.journalPath);
+    const events: string[] = [];
+    const originalUpdate = h.accounts.updateTokens.bind(h.accounts);
+    h.accounts.updateTokens = async (label, tokens) => {
+      events.push("commit-start");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const updated = await originalUpdate(label, tokens);
+      events.push("commit-end");
+      return updated;
+    };
+
+    const replay = h.manager.replayJournal();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Stands in for another OpenCode process contending for the same lock.
+    const otherProcess = h.state.withLock(() => {
+      events.push("other-process-lock");
+    });
+    await Promise.all([replay, otherProcess]);
+
+    assert.deepEqual(events, ["commit-start", "commit-end", "other-process-lock"]);
+  });
+
+  it("refreshLabel uses a pending journal instead of spending the dead keychain token", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })], (token) => {
+      if (token === "refresh-alice") throw new Error("Token refresh failed (400): invalid_grant");
+      throw new Error(`unexpected refresh with ${token}`);
+    });
+    writePendingJournal(h.journalPath);
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.refresh, "recovered-refresh");
+    assert.deepEqual(h.refreshCalls, []);
+    assert.equal(fs.existsSync(h.journalPath), false);
+  });
 });
 
+function writePendingJournal(journalPath: string): void {
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.writeFileSync(
+    journalPath,
+    JSON.stringify({
+      label: "alice",
+      tokens: {
+        access: "recovered-access",
+        refresh: "recovered-refresh",
+        expires: NOW + 3_600_000,
+      },
+      writtenAt: NOW - 5_000,
+    }),
+  );
+}
+
 describe("rotation manager rotation", () => {
+  it("a penalty applied after the switch keeps the new active account", async (t) => {
+    const h = harness(t, [record("alice"), record("bob")]);
+    await h.manager.acquire();
+    await h.manager.acquire(new Set(["alice"]));
+    assert.equal(h.state.load().activeLabel, "bob");
+
+    await h.manager.applyDecision("alice", {
+      action: "ROTATE_DISABLE",
+      reason: "credential rejected",
+      source: "status",
+    });
+
+    assert.equal(h.state.load().activeLabel, "bob");
+    assert.equal(h.state.load().accounts.alice?.disabled, true);
+  });
+
   it("rotates to the other account after a cooldown decision", async (t) => {
     const h = harness(t, [record("alice"), record("bob")]);
 
@@ -332,18 +420,23 @@ describe("exhaustion messaging", () => {
       NOW,
     );
 
-    assert.match(message, /bob/);
-    assert.match(message, /alice/);
-    assert.match(message, /60m/);
-    assert.match(message, /re-authentication/i);
+    // Single line on purpose: opencode renders session errors as a 5s toast
+    // with a hardcoded duration, so anything longer is unreadable before it
+    // disappears. The full breakdown belongs in the dashboard.
+    assert.equal(message.split("\n").length, 1);
+    assert.ok(message.length <= 80, `message too long for a toast: ${message.length}`);
+    assert.match(message, /bob/, "names the account that frees up first");
+    assert.match(message, /60m|1h/, "states when it frees up");
   });
 
-  it("says recovery is impossible when every account is disabled", () => {
+  it("points at re-enrollment when every account is disabled", () => {
     const message = describeExhaustion(
       { earliestReset: null, cooling: [], disabled: ["alice", "bob"] },
       NOW,
     );
 
-    assert.match(message, /no account will recover automatically/i);
+    assert.equal(message.split("\n").length, 1);
+    assert.match(message, /2 accounts disabled/i);
+    assert.match(message, /re-enroll|re-login/i);
   });
 });

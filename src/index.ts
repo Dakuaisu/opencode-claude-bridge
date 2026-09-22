@@ -1,30 +1,30 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
   parseAuthCode,
+  parsePastedState,
   refreshTokens,
   startOAuthCallbackServer,
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
   BETA_FLAGS,
-  CLI_VERSION,
+  getCliVersion,
   OAUTH_BETA_FLAG,
   ANTHROPIC_VERSION,
   BILLING_CCH,
   STAINLESS_HEADERS,
-  USER_AGENT,
+  getUserAgent,
   PROFILE_URL,
   CLI_BUILD_ID,
   ENTRYPOINT,
   DEFAULT_EFFORT,
   CLEAR_THINKING_TYPE,
   SESSION_ID,
-  POOL_TOAST_DURATION_MS,
   POOL_DASHBOARD_TOAST_DURATION_MS,
 } from "./constants.js";
 import {
@@ -41,6 +41,7 @@ import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
 import { autoEnrollIfNew } from "./pool/enroll.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
+import type { RotationDecision } from "./pool/types.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -344,7 +345,7 @@ async function refreshAuth(
   const errors: string[] = [];
   const attemptedRefreshTokens = new Set<string>();
 
-  const tryRefresh = (refreshToken: string | undefined): Tokens | null => {
+  const tryRefresh = async (refreshToken: string | undefined): Promise<Tokens | null> => {
     if (!refreshToken || attemptedRefreshTokens.has(refreshToken)) return null;
     attemptedRefreshTokens.add(refreshToken);
     return refreshTokens(refreshToken);
@@ -354,7 +355,7 @@ async function refreshAuth(
   // valid. Expired keychain refresh tokens are often stale after re-login, so
   // do not try them before OpenCode's own stored OAuth refresh token.
   try {
-    const kt = getClaudeTokens({ refreshExpired: false });
+    const kt = getClaudeTokens();
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
   } catch (err) {
     errors.push(String(err));
@@ -362,7 +363,7 @@ async function refreshAuth(
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
-    try { fresh = tryRefresh(auth.refresh); }
+    try { fresh = await tryRefresh(auth.refresh); }
     catch (err) { errors.push(String(err)); }
   }
 
@@ -371,17 +372,24 @@ async function refreshAuth(
     try {
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
-        fresh = tryRefresh(creds.claudeAiOauth.refreshToken);
+        fresh = await tryRefresh(creds.claudeAiOauth.refreshToken);
     } catch (err) {
       errors.push(String(err));
     }
   }
 
   if (fresh) {
-    await storeAuth(client, fresh);
+    // In memory first: the old refresh token is already spent, so if persisting
+    // fails these are the only valid credentials this process has.
     auth.access = fresh.access;
     auth.refresh = fresh.refresh;
     auth.expires = fresh.expires;
+    try {
+      await storeAuth(client, fresh);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message.split("\n")[0]!.slice(0, 200) : String(err);
+      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; they stay valid in memory until restart: ${detail}`);
+    }
     return fresh.access;
   }
 
@@ -439,13 +447,50 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
   }
 }
 
+function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Pool bookkeeping waits on a cross-process lock that a slow token refresh
+// elsewhere can hold past the 10s timeout; that must never fail a request.
+async function recordPoolState(what: string, action: () => Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (err) {
+    console.error(`[claude-pool] could not record ${what}; continuing: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+export function failureSignature(status: number, bodyText: string): string {
+  try {
+    const parsed = JSON.parse(bodyText) as { error?: { type?: unknown; message?: unknown } };
+    if (parsed?.error && typeof parsed.error === "object") {
+      return `${status}|${String(parsed.error.type ?? "")}|${String(parsed.error.message ?? "")}`;
+    }
+  } catch {}
+  return `${status}|${bodyText.trim().slice(0, 500)}`;
+}
+
 /** Build deduplicated beta flags string. */
 function buildBetaFlags(existing: string): string {
-  const required = BETA_FLAGS.split(",").map((b) => b.trim()).filter(Boolean);
-  const withoutSpecials = required.filter(
+  // Dropping caller flags makes the API reject newer body fields they gate.
+  const split = (s: string) => s.split(",").map((b) => b.trim()).filter(Boolean);
+  const merged = [...split(BETA_FLAGS), ...split(existing)];
+  const withoutSpecials = merged.filter(
     (beta) => beta !== "claude-code-20250219" && beta !== OAUTH_BETA_FLAG,
   );
-  return ["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials].join(",");
+  return [...new Set(["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials])].join(",");
 }
 
 /** Deduplicate repeated Claude Code prefix in a text block. */
@@ -533,6 +578,22 @@ function readCachedClaudePromptCache(): ClaudeSystemPromptCache | null {
   }
 }
 
+let promptCacheMtime = -1;
+let promptCache: ClaudeSystemPromptCache | null = null;
+
+// Re-read when the file changes, so a fresh capture applies without a restart.
+function currentPromptCache(): ClaudeSystemPromptCache | null {
+  let mtime = 0;
+  try {
+    mtime = statSync(SYSTEM_PROMPT_CACHE_PATH).mtimeMs;
+  } catch {}
+  if (mtime !== promptCacheMtime) {
+    promptCacheMtime = mtime;
+    promptCache = mtime ? readCachedClaudePromptCache() : null;
+  }
+  return promptCache;
+}
+
 function getStableDeviceId(): string {
   let who = "unknown";
   try {
@@ -557,8 +618,8 @@ function buildBillingHeader(
   const suffix = dynamicFingerprint
     || cachedClaudePromptCache?.billing?.ccVersionSuffix
     || CLI_BUILD_ID;
-  const ccVersion = cachedClaudePromptCache?.billing?.ccVersion
-    || `${CLI_VERSION}.${suffix}`;
+  // Deliberately ignores the capture: the API gates model access on this.
+  const ccVersion = `${getCliVersion()}.${suffix}`;
   const ccEntrypoint = cachedClaudePromptCache?.billing?.ccEntrypoint || ENTRYPOINT;
   return `x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=${ccEntrypoint}; cch=${cch};`;
 }
@@ -573,7 +634,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
         headers: {
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
-          "user-agent": USER_AGENT,
+          "user-agent": getUserAgent(),
           "anthropic-beta": OAUTH_BETA_FLAG,
         },
       });
@@ -585,6 +646,9 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
   })();
 
   oauthProfileCache.set(accessToken, pending);
+  void pending.then((profile) => {
+    if (!profile) oauthProfileCache.delete(accessToken);
+  });
   return pending;
 }
 
@@ -596,8 +660,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const savedApiKey = process.env.ANTHROPIC_API_KEY;
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
-  const cachedClaudePromptCache = readCachedClaudePromptCache();
-  const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
 
   // Multi-account pool. Inactive until the user enrolls an account, in which
   // case every path below falls back to the original single-account behaviour.
@@ -640,33 +702,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     if (poolActive) {
       await pool.acquire();
     } else {
-      const tokens = getClaudeTokens({ refreshExpired: false });
+      const tokens = getClaudeTokens();
       if (tokens) await storeAuth(client, tokens);
     }
   } catch {}
-
-  /**
-   * Surface pool exhaustion in the TUI as well as in the response body.
-   *
-   * The 429 body still carries the detail (some hosts have no TUI), but a chat
-   * error is easy to miss mid-session, so the same message is also raised as a
-   * toast. Best-effort: a host without the TUI control API must not break the
-   * request path, so every failure here is swallowed.
-   */
-  const notifyExhausted = async (message: string): Promise<void> => {
-    try {
-      await client.tui?.showToast?.({
-        body: {
-          title: "Claude pool exhausted",
-          message,
-          variant: "warning",
-          duration: POOL_TOAST_DURATION_MS,
-        },
-      });
-    } catch {
-      /* toast is advisory only */
-    }
-  };
 
   return {
     /**
@@ -713,7 +752,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               const acquired = await pool.acquire();
               if (acquired.kind === "ok") auth = await getAuth();
             } else {
-              const tokens = getClaudeTokens({ refreshExpired: false });
+              const tokens = getClaudeTokens();
               if (tokens) {
                 await storeAuth(client, tokens);
                 auth = { type: "oauth", ...tokens };
@@ -756,7 +795,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
                 console.error(`[claude-pool] ${message}`);
-                await notifyExhausted(message);
                 return buildPoolExhaustedResponse(
                   message,
                   acquired.info.earliestReset,
@@ -765,7 +803,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               }
               activeLabel = acquired.label;
               accessToken = acquired.accessToken;
-            } else if (!accessToken || !auth.expires || auth.expires < Date.now()) {
+            } else if (!accessToken || !auth.expires || auth.expires < Date.now() + 60_000) {
               try {
                 accessToken = await refreshAuth(auth, client);
               } catch (err) {
@@ -789,7 +827,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.delete("x-session-affinity");
             headers.delete("x-session-id");
             if (!headers.has("accept")) headers.set("accept", "application/json");
-            headers.set("user-agent", USER_AGENT);
+            headers.set("user-agent", getUserAgent());
             headers.set("x-app", "cli");
             headers.set("x-claude-code-session-id", sessionId);
             headers.set("anthropic-version", ANTHROPIC_VERSION);
@@ -800,6 +838,17 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
 
             // ── Body ──
+            const userIdFor = async (token: string): Promise<string | undefined> => {
+              const profile = await fetchOAuthProfile(token);
+              if (!profile?.account?.uuid) return undefined;
+              return JSON.stringify({
+                device_id: deviceId,
+                account_uuid: profile.account.uuid,
+                session_id: sessionId,
+              });
+            };
+            let ownsUserId = false;
+
             let body = init?.body;
             if (body && typeof body === "string") {
               try {
@@ -840,6 +889,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   parsed.temperature = 1;
                 }
 
+                if (typeof parsed.system === "string") {
+                  parsed.system = [{ type: "text", text: parsed.system }];
+                }
                 if (!parsed.system) parsed.system = [];
                 if (Array.isArray(parsed.messages)) {
                   parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
@@ -858,16 +910,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   }
                 }
 
-                const profile = auth.access
-                  ? await fetchOAuthProfile(auth.access)
-                  : null;
                 if (!parsed.metadata) parsed.metadata = {};
-                if (!parsed.metadata.user_id && profile?.account?.uuid) {
-                  parsed.metadata.user_id = JSON.stringify({
-                    device_id: deviceId,
-                    account_uuid: profile.account.uuid,
-                    session_id: sessionId,
-                  });
+                if (!parsed.metadata.user_id) {
+                  ownsUserId = true;
+                  const userId = await userIdFor(accessToken);
+                  if (userId) parsed.metadata.user_id = userId;
                 }
 
                 // Compute dynamic fingerprint from the first user message
@@ -885,6 +932,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   (s: { text?: string }) =>
                     s.text?.startsWith("x-anthropic-billing-header:"),
                 );
+                const cachedClaudePromptCache = currentPromptCache();
+                const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
                 let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
                 if (!hasBilling) {
                   parsed.system.unshift({
@@ -953,7 +1002,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {}
+              } catch (err) {
+                ownsUserId = false;
+                console.error(
+                  `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
             }
 
             // ── URL: add ?beta=true ──
@@ -1000,6 +1054,16 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               const maxRotations = (await pool.listLabels()).length;
               let rotations = 0;
               let attempt = 0;
+              const tried = new Set<string>();
+              // 401/403 penalties wait until another account answers differently:
+              // identical failures mean the request is at fault, not the accounts.
+              let unconfirmed: { label: string; decision: RotationDecision; signature: string } | null = null;
+              const confirmPenalty = async () => {
+                if (!unconfirmed) return;
+                const { label, decision } = unconfirmed;
+                unconfirmed = null;
+                await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
+              };
 
               for (;;) {
                 const headers: Record<string, string> = {};
@@ -1029,34 +1093,64 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   attempt,
                 });
 
-                if (decision.action === "PASS_THROUGH") return rebuild();
+                if (decision.action === "PASS_THROUGH") {
+                  await confirmPenalty();
+                  return rebuild();
+                }
 
                 if (decision.action === "RETRY_SAME") {
                   attempt += 1;
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
                   );
-                  await new Promise((r) => setTimeout(r, decision.backoffMs ?? 1000));
+                  await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
                   response = await doFetch();
-                  if (response.ok) break;
+                  if (response.ok) {
+                    await confirmPenalty();
+                    break;
+                  }
                   continue;
                 }
 
                 // ROTATE_COOLDOWN / ROTATE_DISABLE
-                console.error(
-                  `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
-                );
-                await pool.applyDecision(activeLabel, decision);
+                const signature = failureSignature(response.status, bodyText);
+                if (unconfirmed && unconfirmed.signature === signature) {
+                  console.error(
+                    `[claude-pool] "${unconfirmed.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
+                  );
+                  return rebuild();
+                }
+                await confirmPenalty();
+                tried.add(activeLabel);
+
+                if (response.status === 401 || response.status === 403) {
+                  console.error(
+                    `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
+                  );
+                  unconfirmed = { label: activeLabel, decision, signature };
+                } else {
+                  console.error(
+                    `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
+                  );
+                  const penalised = activeLabel;
+                  await recordPoolState(`penalty for "${penalised}"`, () => pool.applyDecision(penalised, decision));
+                }
 
                 rotations += 1;
                 if (rotations > maxRotations) return rebuild();
 
-                const next = await pool.acquire();
+                const next = await pool.acquire(tried);
+                if (next.kind === "exhausted" && unconfirmed) {
+                  // Unconfirmed disables need manual repair; surface the real error.
+                  console.error(
+                    `[claude-pool] no other account available to confirm "${activeLabel}" is at fault; passing the error through without penalising it`,
+                  );
+                  return rebuild();
+                }
                 if (next.kind === "exhausted") {
                   const message = pool.describeExhaustion(next.info);
                   console.error(`[claude-pool] ${message}`);
-                  await notifyExhausted(message);
-                  return buildPoolExhaustedResponse(
+                    return buildPoolExhaustedResponse(
                     message,
                     next.info.earliestReset,
                     Date.now(),
@@ -1065,15 +1159,45 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 activeLabel = next.label;
                 outHeaders["authorization"] = `Bearer ${next.accessToken}`;
+                if (ownsUserId && typeof body === "string") {
+                  const rebound = JSON.parse(body);
+                  const userId = await userIdFor(next.accessToken);
+                  rebound.metadata ??= {};
+                  if (userId) rebound.metadata.user_id = userId;
+                  else delete rebound.metadata.user_id;
+                  body = JSON.stringify(rebound);
+                }
                 attempt = 0;
                 console.error(`[claude-pool] now using account "${activeLabel}"`);
                 response = await doFetch();
-                if (response.ok) break;
+                if (response.ok) {
+                  await confirmPenalty();
+                  break;
+                }
               }
             }
 
             if (poolActive && activeLabel && response.ok) {
-              await pool.markSuccess(activeLabel);
+              const served = activeLabel;
+              await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served));
+            }
+
+            if (!poolActive && response.status === 401) {
+              console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
+              let freshToken: string | null = null;
+              try {
+                freshToken = await refreshAuth(auth, client);
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.error(`[opencode-claude-bridge] OAuth refresh failed after 401: ${detail}`);
+                await response.body?.cancel();
+                return buildAuthFailureResponse(detail);
+              }
+              if (freshToken && freshToken !== accessToken) {
+                await response.body?.cancel();
+                outHeaders["authorization"] = `Bearer ${freshToken}`;
+                response = await doFetch();
+              }
             }
 
             // Legacy single-account path: refresh the token and retry, on the
@@ -1095,7 +1219,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
                 // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+                await abortableSleep(1000 * (retry + 1), init?.signal);
+                await response.body?.cancel();
                 response = await doFetch();
                 if (response.status !== 429) break;
               }
@@ -1145,6 +1270,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     }
                   })();
                 },
+                cancel(reason) {
+                  return reader.cancel(reason);
+                },
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },
             );
@@ -1158,7 +1286,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           type: "oauth" as const,
           authorize: async () => {
             // First try: auto-bootstrap from Claude CLI keychain
-            const tokens = getClaudeTokens({ refreshExpired: false });
+            const tokens = getClaudeTokens();
             if (tokens) {
               await storeAuth(client, tokens);
               return {
@@ -1179,7 +1307,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             }
 
             if (callbackServer) {
-              const { url, manualUrl, verifier, port } = callbackServer;
+              const { url, manualUrl, verifier, port, state } = callbackServer;
               const redirectUri = `http://localhost:${port}/callback`;
 
               // Best-effort browser open
@@ -1210,12 +1338,18 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                     if (autoCode) {
                       // Auto-flow captured the code via localhost redirect
-                      const tokens = exchangeCodeForTokens(autoCode, verifier, redirectUri);
+                      const tokens = await exchangeCodeForTokens(autoCode, verifier, redirectUri);
                       await storeAuth(client, tokens);
                       callbackServer?.close();
                       return { type: "success" as const, ...tokens };
                     }
 
+                    const pastedState = parsePastedState(manualInput);
+                    if (pastedState !== null && pastedState !== state) {
+                      console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                      callbackServer?.close();
+                      return { type: "failed" as const };
+                    }
                     const code = parseAuthCode(manualInput);
                     if (!code) {
                       console.error("[opencode-oauth] No authorization code received");
@@ -1224,7 +1358,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     }
 
                     // Manual flow — redirect_uri defaults to MANUAL_REDIRECT_URL
-                    const tokens = exchangeCodeForTokens(code, verifier);
+                    const tokens = await exchangeCodeForTokens(code, verifier);
                     await storeAuth(client, tokens);
                     callbackServer?.close();
                     return { type: "success" as const, ...tokens };
@@ -1239,7 +1373,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             // Fallback: no callback server — use manual redirect URL flow only.
             // This is the path for environments where we can't bind localhost.
-            const { url, verifier } = createAuthorizationRequest();
+            const { url, verifier, state } = createAuthorizationRequest();
 
             openBrowser(url);
 
@@ -1249,8 +1383,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               method: "code" as const,
               callback: async (code: string) => {
                 try {
+                  const pastedState = parsePastedState(code);
+                  if (pastedState !== null && pastedState !== state) {
+                    console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                    return { type: "failed" as const };
+                  }
                   // redirect_uri defaults to MANUAL_REDIRECT_URL in exchangeCodeForTokens
-                  const tokens = exchangeCodeForTokens(parseAuthCode(code), verifier);
+                  const tokens = await exchangeCodeForTokens(parseAuthCode(code), verifier);
                   await storeAuth(client, tokens);
                   return { type: "success" as const, ...tokens };
                 } catch (err) {

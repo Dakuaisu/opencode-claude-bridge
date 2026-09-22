@@ -295,9 +295,10 @@ function resolveWindows(headers: unknown, now: number): RotationDecision["window
     );
     const claimRaw = readHeader(headers, UNIFIED_CLAIM_HEADER);
     const claim = typeof claimRaw === "string" ? claimRaw.trim().toLowerCase() : undefined;
+    // Absent header: undefined, so the stored window is left alone rather than erased.
     const binding =
-      claim === "five_hour" || claim === "seven_day" ? claim : null;
-    if (five === undefined && seven === undefined && binding === null) return undefined;
+      claim === undefined ? undefined : claim === "five_hour" || claim === "seven_day" ? claim : null;
+    if (five === undefined && seven === undefined && binding == null) return undefined;
     return {
       fiveHourReset: five === undefined ? null : now + five * 1000,
       sevenDayReset: seven === undefined ? null : now + seven * 1000,
