@@ -11,6 +11,7 @@
  */
 
 import { formatDashboard } from "./dashboard.js";
+import { LabelConflictError } from "./enroll.js";
 import { renderBar, type AccountUsage } from "./usage.js";
 import type { PoolSnapshot, PoolSnapshotRow, RotationManager } from "./manager.js";
 import type { RotationStateStore } from "./rotation-state.js";
@@ -60,7 +61,7 @@ export interface TuiDeps {
   accounts: AccountStore;
   state: RotationStateStore;
   /** Enroll whichever account the Claude CLI is currently logged into. */
-  enroll: (label?: string) => Promise<string>;
+  enroll: (label?: string, options?: { replace?: boolean }) => Promise<string>;
   /** Email the Claude CLI is currently logged in as, for the header hint. */
   whoami?: () => Promise<string | null>;
   /**
@@ -538,6 +539,9 @@ export function createPoolTui(deps: TuiDeps) {
       message = "";
       return afterMove();
     }
+    // Keys arrive concurrently with an in-flight action, which could otherwise
+    // replace a pending confirm prompt with one for a different account.
+    if (busy) return;
     if (key === "r") return act("reload", async () => "reloaded");
     if (key === "\r" || key === "\n") {
       expanded = !expanded;
@@ -602,7 +606,21 @@ export function createPoolTui(deps: TuiDeps) {
       return render();
     }
     if (key === "e") {
-      return act("enroll", async () => `enrolled "${await deps.enroll()}"`);
+      return act("enroll", async () => {
+        try {
+          return `enrolled "${await deps.enroll()}"`;
+        } catch (err) {
+          // A label held by a known different email is resolved by enroll itself;
+          // an unknown owner may be this same account, so let the user decide.
+          if (!(err instanceof LabelConflictError) || err.existingEmail) throw err;
+          const { label } = err;
+          confirm = {
+            prompt: `"${label}" belongs to an account with no known email. Replace it with the Claude CLI login?`,
+            run: async () => `replaced "${await deps.enroll(label, { replace: true })}"`,
+          };
+          return `"${label}" is already taken`;
+        }
+      });
     }
     if (key === "c") {
       return act("clear cooldowns", async () => {

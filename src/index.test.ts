@@ -26,26 +26,15 @@ import {
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
+  supportsAdaptiveThinking,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
-
-// ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
-
-const THINKING_MODELS = [
-  "claude-opus-4",
-  "claude-sonnet-4-6",
-];
-
-function shouldInjectThinking(model: string | undefined): boolean {
-  if (!model) return false;
-  return THINKING_MODELS.some((m) => model.includes(m));
-}
 
 // Simulate the body-transform logic from the fetch wrapper
 function transformBody(bodyStr: string): Record<string, unknown> {
   const parsed = JSON.parse(bodyStr);
 
-  const supportsThinking = shouldInjectThinking(parsed.model);
+  const supportsThinking = supportsAdaptiveThinking(parsed.model);
   if (!parsed.thinking && supportsThinking) {
     parsed.thinking = { type: "adaptive" };
   }
@@ -94,6 +83,13 @@ describe("thinking injection", () => {
     const out = transformBody(JSON.stringify({ model: "claude-opus-4-6", messages: [] }));
     assert.deepEqual(out.thinking, { type: "adaptive" });
   });
+
+  for (const model of ["claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1"]) {
+    it(`injects adaptive thinking for ${model}`, () => {
+      const out = transformBody(JSON.stringify({ model, messages: [] }));
+      assert.deepEqual(out.thinking, { type: "adaptive" });
+    });
+  }
 
   it("does not overwrite an existing thinking block", () => {
     const out = transformBody(
@@ -988,12 +984,13 @@ describe("SSE processor: error handling", () => {
       translateToolArgs: translateToolArgsJsonString,
       debug: (m) => messages.push(m),
     });
-    const malformed = "event: content_block_start\ndata: {not valid\n\n";
+    const malformed = "event: content_block_start\ndata: {not valid sk-ant-secret\n\n";
     const out = proc.feedChunk(malformed);
     // Passed through as-is
     assert.equal(out, malformed);
-    // And we told the operator about it (behind their debug flag)
+    // And we told the operator about it, without copying stream content into the log
     assert.ok(messages.some((m) => m.includes("JSON.parse failed")), `Expected debug log, got: ${JSON.stringify(messages)}`);
+    assert.ok(messages.every((m) => !m.includes("sk-ant-secret") && !m.includes("not valid")), `Leaked payload: ${JSON.stringify(messages)}`);
   });
 
   it("calls debug callback when translateToolArgs throws", () => {
@@ -1135,6 +1132,16 @@ describe("deriveModelDisplayName", () => {
 
   it("ignores a trailing date suffix (claude-haiku-4-5-20251001 → Haiku 4.5)", () => {
     assert.equal(deriveModelDisplayName("claude-haiku-4-5-20251001"), "Haiku 4.5");
+  });
+
+  it("renders major-only ids (claude-sonnet-5 → Sonnet 5)", () => {
+    assert.equal(deriveModelDisplayName("claude-sonnet-5"), "Sonnet 5");
+    assert.equal(deriveModelDisplayName("claude-opus-5-5"), "Opus 5.5");
+    assert.equal(deriveModelDisplayName("claude-fable-5-1"), "Fable 5.1");
+  });
+
+  it("does not read a date as a minor version (claude-sonnet-5-20260101 → Sonnet 5)", () => {
+    assert.equal(deriveModelDisplayName("claude-sonnet-5-20260101"), "Sonnet 5");
   });
 
   it("falls back to the raw id when the convention doesn't match", () => {

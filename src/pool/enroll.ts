@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 import type {
   AccountRecord,
@@ -7,11 +8,26 @@ import type {
 } from "./types.js";
 import type { AccountStore } from "./manager.js";
 import { PROFILE_URL } from "../constants.js";
+import { claudeCredentialsPath } from "../keychain.js";
 
 const CLAUDE_CLI_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
 
 export class EnrollmentError extends Error {}
+
+/** The label is held by an account that may or may not be this one; only the user can decide. */
+export class LabelConflictError extends EnrollmentError {
+  constructor(
+    readonly label: string,
+    readonly existingEmail: string | null,
+  ) {
+    super(
+      existingEmail
+        ? `Label "${label}" already belongs to a different account (${existingEmail}). Choose another label or pass --replace.`
+        : `Label "${label}" belongs to an account whose email was never resolved; it may be this one. Pass --replace to overwrite it, or choose another label.`,
+    );
+  }
+}
 
 const MAX_LABEL_LENGTH = 64;
 
@@ -109,9 +125,14 @@ export function toAccountRecord(
 
 export function readClaudeCliCredentialsRaw(): string {
   if (process.platform !== "darwin") {
-    throw new EnrollmentError(
-      "Snapshot enrollment currently reads the macOS keychain only",
-    );
+    const path = claudeCredentialsPath();
+    try {
+      return readFileSync(path, "utf8").trim();
+    } catch {
+      throw new EnrollmentError(
+        `No Claude CLI credentials found at ${path}. Run \`claude login\` first.`,
+      );
+    }
   }
   try {
     return execFileSync(
@@ -155,6 +176,14 @@ function findByEmail(accounts: AccountRecord[], email: string | undefined): Acco
   if (!email) return undefined;
   const wanted = email.toLowerCase();
   return accounts.find((a) => a.email?.toLowerCase() === wanted);
+}
+
+function firstFreeLabel(base: string, accounts: AccountRecord[]): string {
+  const taken = new Set(accounts.map((a) => a.label));
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n += 1;
+  return `${base}-${n}`;
 }
 
 export interface EnrollOptions {
@@ -225,9 +254,14 @@ export async function enrollFromClaudeCli(
       && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
   );
   if (sameLabelDifferentAccount && opts.replace !== true) {
-    throw new EnrollmentError(
-      `Label "${label}" already belongs to a different account (${sameLabelDifferentAccount.email ?? "unknown email"}). Choose another label or pass --replace.`,
-    );
+    const derived = opts.label === undefined;
+    const otherPerson = Boolean(email && sameLabelDifferentAccount.email);
+    if (derived && otherPerson) {
+      // alice@work and alice@home derive the same label; both belong in the pool.
+      label = firstFreeLabel(label, existing);
+    } else {
+      throw new LabelConflictError(label, sameLabelDifferentAccount.email ?? null);
+    }
   }
 
   const record = toAccountRecord(label, creds, now, email);
@@ -314,12 +348,7 @@ export async function autoEnrollIfNew(
     return { status: "no-label" };
   }
 
-  const taken = new Set(existing.map((a) => a.label));
-  if (taken.has(label)) {
-    let n = 2;
-    while (taken.has(`${label}-${n}`)) n += 1;
-    label = `${label}-${n}`;
-  }
+  label = firstFreeLabel(label, existing);
 
   try {
     await opts.accounts.putAccount(toAccountRecord(label, creds, now, email));

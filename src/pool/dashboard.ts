@@ -24,7 +24,7 @@ function relative(target: number, now: number): string {
   return deltaMs >= 0 ? `in ${text}` : `${text} ago`;
 }
 
-function truncate(text: string, max: number): string {
+export function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 

@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import type { TestContext } from "node:test";
 
 import {
   EnrollmentError,
+  LabelConflictError,
   deriveLabelFromEmail,
   normalizeLabel,
   autoEnrollIfNew,
   parseClaudeCredentials,
+  readClaudeCliCredentialsRaw,
   toAccountRecord,
   enrollFromClaudeCli,
 } from "./enroll.js";
@@ -230,6 +236,115 @@ describe("re-enrolling after a re-login", () => {
       (err: Error) => err instanceof EnrollmentError && /already enrolled as "alice"/.test(err.message),
     );
     assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("reading the Claude CLI login off macOS", () => {
+  function onLinux(t: TestContext, credentials: string | null): string {
+    const dir = mkdtempSync(join(tmpdir(), "claude-config-"));
+    if (credentials !== null) writeFileSync(join(dir, ".credentials.json"), credentials);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const configDir = process.env.CLAUDE_CONFIG_DIR;
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    process.env.CLAUDE_CONFIG_DIR = dir;
+    t.after(() => {
+      Object.defineProperty(process, "platform", platform);
+      if (configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = configDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+    return dir;
+  }
+
+  it("reads the credentials file Claude Code writes on Linux", (t) => {
+    onLinux(t, `${VALID_CLI_JSON}\n`);
+    assert.equal(readClaudeCliCredentialsRaw(), VALID_CLI_JSON);
+  });
+
+  it("explains where it looked when there is no login", (t) => {
+    const dir = onLinux(t, null);
+    assert.throws(
+      () => readClaudeCliCredentialsRaw(),
+      (err: Error) => err instanceof EnrollmentError && err.message.includes(dir) && /claude login/.test(err.message),
+    );
+  });
+});
+
+describe("label collisions", () => {
+  const other = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "sk-ant-oat01-other",
+      refreshToken: "sk-ant-ort01-other",
+      expiresAt: NOW + 3_600_000,
+    },
+  });
+
+  async function storeWithAlice(email?: string) {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, email));
+    return store;
+  }
+
+  it("gives a different person who derives the same label a free suffix", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice-2");
+    assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("asks before overwriting a label whose owner's email is unknown", async () => {
+    const store = await storeWithAlice();
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.label === "alice" && err.existingEmail === null,
+    );
+    assert.equal((await store.listAccounts())[0]?.oauth.refresh, "sk-ant-ort01-xyz");
+  });
+
+  it("still refuses an explicit label that belongs to someone else", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        label: "alice",
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.existingEmail === "alice@work.io",
+    );
+  });
+
+  it("overwrites the conflicting label when replace is set", async () => {
+    const store = await storeWithAlice();
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      label: "alice",
+      replace: true,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice");
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-other");
   });
 });
 

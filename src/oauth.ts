@@ -139,20 +139,30 @@ export function extractOAuthErrorDetail(body: string): string {
   return body.trim();
 }
 
-function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
+/** Used when a response carries valid tokens but no usable lifetime: refresh again soon rather than lose them. */
+export const FALLBACK_TOKEN_LIFETIME_MS = 5 * 60_000;
+
+export function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
   if (status !== 200) {
     throw new Error(`${label} failed (${status}): ${extractOAuthErrorDetail(body)}`);
   }
-  const data = JSON.parse(body) as {
-    access_token: string;
-    refresh_token: string;
-    expires_in: number;
-  };
-  return {
-    access: data.access_token,
-    refresh: data.refresh_token,
-    expires: Date.now() + data.expires_in * 1000,
-  };
+  // Errors here must not quote the body: a 200 body is where the tokens are.
+  let data: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error(`${label} returned a malformed response (HTTP 200, ${body.length} bytes)`);
+  }
+  const { access_token: access, refresh_token: refresh, expires_in: expiresIn } = data ?? {};
+  if (typeof access !== "string" || !access || typeof refresh !== "string" || !refresh) {
+    throw new Error(`${label} returned HTTP 200 without an access and refresh token`);
+  }
+  const hasLifetime = typeof expiresIn === "number" && Number.isFinite(expiresIn) && expiresIn > 0;
+  if (!hasLifetime) {
+    console.error(`[opencode-oauth] ${label} response has no valid expires_in; treating the token as valid for 5 minutes`);
+  }
+  const lifetimeMs = hasLifetime ? expiresIn * 1000 : FALLBACK_TOKEN_LIFETIME_MS;
+  return { access, refresh, expires: Date.now() + lifetimeMs };
 }
 
 /**

@@ -38,7 +38,9 @@ import {
 import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
 import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { truncate } from "./pool/dashboard.js";
 import { autoEnrollIfNew } from "./pool/enroll.js";
+import { createToaster } from "./pool/notify.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
 import type { RotationDecision } from "./pool/types.js";
@@ -119,20 +121,43 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   ExitPlanMode: "plan_exit",
 };
 
+// Fallback catalog, used only for ids the host's own model list lacks.
+// Prices per million tokens, from platform.claude.com/docs/en/about-claude/pricing.
 const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
+  "claude-fable-5-1": {
+    name: "Claude Fable 5.1",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 10, output: 50, cache_read: 0.25, cache_write: 12.5 },
+  },
+  "claude-opus-5-5": {
+    name: "Claude Opus 5.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
+  },
+  "claude-sonnet-5": {
+    name: "Claude Sonnet 5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  },
   "claude-opus-4-6": {
     name: "Claude Opus 4.6",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-opus-4-5": {
     name: "Claude Opus 4.5",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-sonnet-4-6": {
     name: "Claude Sonnet 4.6",
@@ -151,9 +176,9 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
   "claude-haiku-4-5-20251001": {
     name: "Claude Haiku 4.5",
     attachment: true, reasoning: false, tool_call: true, temperature: true,
-    limit: { context: 200000, output: 8192 },
+    limit: { context: 200000, output: 64000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 0.8, output: 4, cache_read: 0.08, cache_write: 1 },
+    cost: { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
   },
 };
 
@@ -186,21 +211,22 @@ const CLAUDE_PREFIX =
 /**
  * Derive a human-readable display name from a Claude model ID.
  *
- * Matches `claude-{family}-{major}-{minor}[-{date}]` (the convention used
+ * Matches `claude-{family}-{major}[-{minor}][-{date}]` (the convention used
  * for every Claude model family to date) and renders e.g.
  *   claude-opus-4-7            -> "Opus 4.7"
  *   claude-haiku-4-5-20251001  -> "Haiku 4.5"
- *   claude-sonnet-4-6          -> "Sonnet 4.6"
+ *   claude-sonnet-5            -> "Sonnet 5"
  *
  * Falls back to the raw model ID if the convention doesn't match, so future
  * naming changes are surfaced truthfully instead of silently wrong.
  */
 export function deriveModelDisplayName(modelId: string): string {
-  const m = modelId.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$/i);
+  // Minor is 1-2 digits so a dated major-only id (claude-sonnet-5-20260101) isn't read as "5.20260101".
+  const m = modelId.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/i);
   if (!m) return modelId;
   const [, family, major, minor] = m;
   const capitalized = family.charAt(0).toUpperCase() + family.slice(1).toLowerCase();
-  return `${capitalized} ${major}.${minor}`;
+  return minor === undefined ? `${capitalized} ${major}` : `${capitalized} ${major}.${minor}`;
 }
 
 /**
@@ -227,6 +253,21 @@ export function rewriteSystemBlocksForModel(
 
     return { ...block, text };
   });
+}
+
+// Explicit allowlist: haiku and older sonnet variants (e.g. claude-sonnet-4-5)
+// reject the field entirely. Opus 4.x and Sonnet 4.6 are confirmed; Fable 5.x,
+// Opus 5.x and Sonnet 5 are documented as adaptive-thinking models.
+const ADAPTIVE_THINKING_MODELS = [
+  "claude-opus-4",
+  "claude-sonnet-4-6",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-fable-5",
+];
+
+export function supportsAdaptiveThinking(model: unknown): boolean {
+  return typeof model === "string" && ADAPTIVE_THINKING_MODELS.some((m) => model.includes(m));
 }
 
 export function stripSystemCacheControl(
@@ -297,6 +338,7 @@ export function getClaudeToolsForActiveOpenCodeTools(
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+const POOL_RECHECK_MS = 30_000;
 
 function buildAuthFailureResponse(detail: string): Response {
   const message = [
@@ -661,9 +703,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
 
+  const toast = createToaster(client);
+
   // Multi-account pool. Inactive until the user enrolls an account, in which
   // case every path below falls back to the original single-account behaviour.
-  const pool: RotationManager = createPool(client);
+  const pool: RotationManager = createPool(client, {
+    onAccountDisabled: (label, reason) => {
+      toast("error", `"${label}" disabled (${truncate(reason, 80)}); re-login, then claude-pool enroll`);
+    },
+  });
   let poolActive = false;
   try {
     poolActive = await pool.isActive();
@@ -679,6 +727,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         console.error(
           `[claude-pool] auto-enrolled "${adopted.label}" (${adopted.email}) from the Claude CLI`,
         );
+        toast("success", `Added "${adopted.label}" (${adopted.email}) to the pool`);
       }
     }
 
@@ -689,6 +738,37 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     );
     poolActive = false;
   }
+
+  // Enrolling the first account or removing the last must apply without a
+  // restart, but listing the keychain on every request is too slow.
+  let poolCheckedAt = Date.now();
+  let poolCheckFailing = false;
+  const currentPoolActive = async (): Promise<boolean> => {
+    if (Date.now() - poolCheckedAt < POOL_RECHECK_MS) return poolActive;
+    poolCheckedAt = Date.now();
+    try {
+      const active = await pool.isActive();
+      if (active && !poolActive) await pool.sync();
+      poolCheckFailing = false;
+      if (active !== poolActive) {
+        poolActive = active;
+        const note = active
+          ? "Accounts enrolled — rotating across the pool"
+          : "No accounts enrolled — using the single OpenCode login";
+        console.error(`[claude-pool] ${note}`);
+        toast("info", note);
+      }
+    } catch (err) {
+      // Keep the last known mode: a locked keychain must not flip it back and forth.
+      if (!poolCheckFailing) {
+        console.error(
+          `[claude-pool] could not re-check enrolled accounts; keeping pool ${poolActive ? "on" : "off"}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      poolCheckFailing = true;
+    }
+    return poolActive;
+  };
 
   // Bootstrap auth at plugin init time — before OpenCode builds its provider
   // state — so the loader runs on startup and models appear immediately
@@ -748,7 +828,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         // anti-clobber reason as the init path above.
         if (auth.type !== "oauth") {
           try {
-            if (poolActive) {
+            if (await currentPoolActive()) {
               const acquired = await pool.acquire();
               if (acquired.kind === "ok") auth = await getAuth();
             } else {
@@ -789,12 +869,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // Label of the pool account serving this request, so a later
             // rate-limit response can be attributed to the right account.
             let activeLabel: string | null = null;
+            const usePool = await currentPoolActive();
 
-            if (poolActive) {
+            if (usePool) {
               const acquired = await pool.acquire();
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
                 console.error(`[claude-pool] ${message}`);
+                toast("warning", message, `exhausted:${acquired.info.earliestReset}`);
                 return buildPoolExhaustedResponse(
                   message,
                   acquired.info.earliestReset,
@@ -864,17 +946,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   );
                 } catch {}
 
-                // Only inject adaptive thinking for models that support it.
-                // Use an explicit allowlist — haiku and older sonnet variants
-                // (e.g. claude-sonnet-4-5) reject the field entirely.
-                // claude-sonnet-4-6 and claude-opus-4-x are confirmed to support
-                // interleaved-thinking-2025-05-14.
-                const THINKING_MODELS = [
-                  "claude-opus-4",
-                  "claude-sonnet-4-6",
-                ];
-                const supportsThinking = parsed.model &&
-                  THINKING_MODELS.some((m: string) => parsed.model.includes(m));
+                const supportsThinking = supportsAdaptiveThinking(parsed.model);
                 if (!parsed.thinking && supportsThinking) {
                   parsed.thinking = { type: "adaptive" };
                 }
@@ -1050,20 +1122,21 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // Only non-2xx bodies are consumed here (short JSON error
             // envelopes, never a live stream), and they are rebuilt verbatim
             // before being handed downstream.
-            if (poolActive && activeLabel && !response.ok) {
+            if (usePool && activeLabel && !response.ok) {
               const maxRotations = (await pool.listLabels()).length;
               let rotations = 0;
               let attempt = 0;
               const tried = new Set<string>();
-              // 401/403 penalties wait until another account answers differently:
-              // identical failures mean the request is at fault, not the accounts.
-              let unconfirmed: { label: string; decision: RotationDecision; signature: string } | null = null;
-              const confirmPenalty = async () => {
-                if (!unconfirmed) return;
-                const { label, decision } = unconfirmed;
-                unconfirmed = null;
-                await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
+              // 401/403 penalties wait until another account SUCCEEDS with the same
+              // request: an identical failure blames the request, and a 429 or 5xx
+              // from the next account says nothing about the first one.
+              const unconfirmed: Array<{ label: string; decision: RotationDecision; signature: string }> = [];
+              const confirmPenalties = async () => {
+                for (const { label, decision } of unconfirmed.splice(0)) {
+                  await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
+                }
               };
+              const unconfirmedLabels = () => unconfirmed.map((u) => `"${u.label}"`).join(", ");
 
               for (;;) {
                 const headers: Record<string, string> = {};
@@ -1094,7 +1167,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 });
 
                 if (decision.action === "PASS_THROUGH") {
-                  await confirmPenalty();
+                  if (unconfirmed.length > 0) {
+                    console.error(
+                      `[claude-pool] no other account succeeded, so ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} not penalised`,
+                    );
+                  }
                   return rebuild();
                 }
 
@@ -1106,7 +1183,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
                   response = await doFetch();
                   if (response.ok) {
-                    await confirmPenalty();
+                    await confirmPenalties();
                     break;
                   }
                   continue;
@@ -1114,20 +1191,20 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 // ROTATE_COOLDOWN / ROTATE_DISABLE
                 const signature = failureSignature(response.status, bodyText);
-                if (unconfirmed && unconfirmed.signature === signature) {
+                const repeated = unconfirmed.find((u) => u.signature === signature);
+                if (repeated) {
                   console.error(
-                    `[claude-pool] "${unconfirmed.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
+                    `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
                   );
                   return rebuild();
                 }
-                await confirmPenalty();
                 tried.add(activeLabel);
 
                 if (response.status === 401 || response.status === 403) {
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
                   );
-                  unconfirmed = { label: activeLabel, decision, signature };
+                  unconfirmed.push({ label: activeLabel, decision, signature });
                 } else {
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
@@ -1140,23 +1217,28 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 if (rotations > maxRotations) return rebuild();
 
                 const next = await pool.acquire(tried);
-                if (next.kind === "exhausted" && unconfirmed) {
+                if (next.kind === "exhausted" && unconfirmed.length > 0) {
                   // Unconfirmed disables need manual repair; surface the real error.
                   console.error(
-                    `[claude-pool] no other account available to confirm "${activeLabel}" is at fault; passing the error through without penalising it`,
+                    `[claude-pool] no other account available to confirm ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} at fault; passing the error through without penalising`,
                   );
                   return rebuild();
                 }
                 if (next.kind === "exhausted") {
                   const message = pool.describeExhaustion(next.info);
                   console.error(`[claude-pool] ${message}`);
-                    return buildPoolExhaustedResponse(
+                  toast("warning", message, `exhausted:${next.info.earliestReset}`);
+                  return buildPoolExhaustedResponse(
                     message,
                     next.info.earliestReset,
                     Date.now(),
                   );
                 }
 
+                const why = unconfirmed.at(-1)?.label === activeLabel
+                  ? `HTTP ${response.status}, checking another account`
+                  : truncate(decision.reason, 60);
+                toast("info", `Switched from "${activeLabel}" to "${next.label}" (${why})`);
                 activeLabel = next.label;
                 outHeaders["authorization"] = `Bearer ${next.accessToken}`;
                 if (ownsUserId && typeof body === "string") {
@@ -1171,18 +1253,18 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 console.error(`[claude-pool] now using account "${activeLabel}"`);
                 response = await doFetch();
                 if (response.ok) {
-                  await confirmPenalty();
+                  await confirmPenalties();
                   break;
                 }
               }
             }
 
-            if (poolActive && activeLabel && response.ok) {
+            if (usePool && activeLabel && response.ok) {
               const served = activeLabel;
               await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served));
             }
 
-            if (!poolActive && response.status === 401) {
+            if (!usePool && response.status === 401) {
               console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
               let freshToken: string | null = null;
               try {
@@ -1202,7 +1284,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             // Legacy single-account path: refresh the token and retry, on the
             // assumption that rate limits are per-access-token.
-            if (!poolActive && response.status === 429) {
+            if (!usePool && response.status === 429) {
               for (let retry = 0; retry < 2; retry++) {
                 console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
                 let freshToken: string | null = null;
@@ -1242,6 +1324,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const processor = createSseProcessor({
               inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
               translateToolArgs: translateToolArgsJsonString,
+              debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
             });
 
             return new Response(
