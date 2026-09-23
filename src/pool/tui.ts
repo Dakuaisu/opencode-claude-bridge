@@ -235,6 +235,9 @@ export function createPoolTui(deps: TuiDeps) {
   }
 
   function render(): void {
+    // An action still in flight when the user quits (e.g. `s`) finishes later;
+    // drawing then would paint the dashboard over the restored shell.
+    if (!running) return;
     const { accounts, now, activeLabel } = snapshot;
     const { cols, rows } = dims();
 
@@ -668,6 +671,9 @@ export function createPoolTui(deps: TuiDeps) {
     if (stdin.isTTY) stdin.setRawMode(false);
     stdin.pause();
     stdout.write(`${CURSOR_SHOW}${ALT_SCREEN_OFF}`);
+    // Not force-exited: the action may be a token refresh, and killing it
+    // mid-request can lose the only valid refresh token.
+    if (busy) stdout.write("claude-pool: finishing the current action before exiting…\n");
   }
 
   async function start(): Promise<void> {

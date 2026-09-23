@@ -180,4 +180,50 @@ describe("pool TUI enroll", () => {
 
     assert.deepEqual(calls, [undefined]);
   });
+
+  it("quitting while an action is in flight does not redraw over the restored shell", async () => {
+    const { EventEmitter } = await import("node:events");
+    const stdin = Object.assign(new EventEmitter(), {
+      isTTY: true, setRawMode: () => undefined, resume: () => undefined, pause: () => undefined, setEncoding: () => undefined,
+    });
+    let restored = false;
+    const afterRestore: string[] = [];
+    const stdout = Object.assign(new EventEmitter(), {
+      isTTY: true, columns: 100, rows: 30,
+      write(chunk: string) {
+        if (restored) afterRestore.push(chunk);
+        if (chunk.includes("\u001b[?1049l")) restored = true;
+        return true;
+      },
+    });
+    let finishUsage: () => void = () => undefined;
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: "a", now: 0, accounts: [row("a", "ready")] }),
+        pendingRefreshLabel: () => null,
+      } as unknown as TuiDeps["pool"],
+      accounts: {} as TuiDeps["accounts"],
+      state: {} as TuiDeps["state"],
+      enroll: async () => "",
+      fetchUsage: () =>
+        new Promise((resolve) => {
+          finishUsage = () => resolve({ fiveHour: null, sevenDay: null, extra: null } as never);
+        }),
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+    });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+    const started = tui.start();
+    await tick();
+    stdin.emit("data", "s");
+    await tick();
+    stdin.emit("data", "q");
+    await started;
+    finishUsage();
+    await tick();
+
+    assert.equal(afterRestore.length, 1);
+    assert.match(afterRestore[0]!, /finishing the current action/);
+  });
 });
