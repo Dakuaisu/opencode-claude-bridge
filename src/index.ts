@@ -37,9 +37,10 @@ import {
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
-import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { buildPoolBusyResponse, buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { LockTimeoutError } from "./pool/rotation-state.js";
 import { truncate } from "./pool/dashboard.js";
-import { autoEnrollIfNew } from "./pool/enroll.js";
+import { autoEnrollIfNew, labelSharingClaudeCliLogin, sharedLoginWarning } from "./pool/enroll.js";
 import { createToaster } from "./pool/notify.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
@@ -731,7 +732,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
       }
     }
 
-    if (poolActive) await pool.sync();
+    if (poolActive) {
+      await pool.sync();
+      const shared = await labelSharingClaudeCliLogin(createAccountStore(createSecretBackend()));
+      if (shared) {
+        console.error(`[claude-pool] ${sharedLoginWarning(shared)}`);
+        toast("warning", sharedLoginWarning(shared));
+      }
+    }
   } catch (err) {
     console.error(
       `[claude-pool] disabled (${err instanceof Error ? err.message : String(err)})`,
@@ -872,7 +880,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const usePool = await currentPoolActive();
 
             if (usePool) {
-              const acquired = await pool.acquire();
+              let acquired: Awaited<ReturnType<typeof pool.acquire>>;
+              try {
+                acquired = await pool.acquire();
+              } catch (err) {
+                if (!(err instanceof LockTimeoutError)) throw err;
+                console.error(`[claude-pool] ${err.message}`);
+                return buildPoolBusyResponse();
+              }
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
                 console.error(`[claude-pool] ${message}`);
@@ -1216,7 +1231,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 rotations += 1;
                 if (rotations > maxRotations) return rebuild();
 
-                const next = await pool.acquire(tried);
+                let next: Awaited<ReturnType<typeof pool.acquire>>;
+                try {
+                  next = await pool.acquire(tried);
+                } catch (err) {
+                  if (!(err instanceof LockTimeoutError)) throw err;
+                  console.error(`[claude-pool] ${err.message}; passing the current error through`);
+                  return rebuild();
+                }
                 if (next.kind === "exhausted" && unconfirmed.length > 0) {
                   // Unconfirmed disables need manual repair; surface the real error.
                   console.error(

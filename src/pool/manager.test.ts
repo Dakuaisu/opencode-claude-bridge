@@ -60,6 +60,7 @@ interface Harness {
   mirrored: PoolOAuthTokens[];
   disabledEvents: string[];
   journalPath: string;
+  statePath: string;
   setNow: (n: number) => void;
 }
 
@@ -77,8 +78,9 @@ function harness(
   let now = NOW;
   const clock = () => now;
   const accounts = createAccountStore(memoryBackend(seed));
+  const statePath = path.join(root, "rotation-state.json");
   const state = createRotationStateStore({
-    path: path.join(root, "rotation-state.json"),
+    path: statePath,
     clock,
     lockPollMs: 1,
   });
@@ -119,6 +121,7 @@ function harness(
     mirrored,
     disabledEvents,
     journalPath,
+    statePath,
     setNow: (n) => {
       now = n;
     },
@@ -199,6 +202,105 @@ describe("rotation manager token acquisition", () => {
     await h.manager.acquire();
 
     assert.deepEqual(order, ["journal-first"]);
+  });
+});
+
+describe("rotation manager token-endpoint firewall pages", () => {
+  it("cools every account on an HTML 403 instead of disabling the pool", async (t) => {
+    const { parseTokenResponse } = await import("../oauth.js");
+    const page = "<html><head><title>Just a moment...</title></head><body>challenge</body></html>";
+    const h = harness(
+      t,
+      ["a", "b", "c"].map((label) => record(label, { expires: NOW - 1 })),
+      () => parseTokenResponse(403, page, "Token refresh"),
+    );
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind, "exhausted");
+    for (const account of Object.values(h.state.load().accounts)) {
+      assert.equal(account.disabled, false);
+      assert.ok((account.cooldownUntil ?? 0) > NOW);
+      assert.ok(!account.lastReason?.includes("<html"), account.lastReason ?? "");
+    }
+  });
+});
+
+describe("rotation manager lock contention during refresh", () => {
+  // A second process on the same pool: real-clock locks with a short timeout.
+  function otherProcess(h: Harness, refreshCalls: string[]) {
+    return createRotationManager({
+      accounts: h.accounts,
+      state: createRotationStateStore({ path: h.statePath, lockPollMs: 1, lockTimeoutMs: 100 }),
+      clock: () => NOW,
+      journalPath: h.journalPath,
+      refreshFn: (token) => {
+        refreshCalls.push(token);
+        throw new Error("must not refresh while another process holds the lock");
+      },
+      mirrorFn: async () => {},
+    });
+  }
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Timeline (ms): holder takes the lock at 0; the other process reads a stale
+  // token at ~20 and then waits for the lock until ~120.
+  function holdLock(h: Harness, holdMs: number, whileHeld: () => Promise<void> = async () => {}) {
+    const holder = createRotationStateStore({ path: h.statePath, lockPollMs: 1 });
+    return holder.withLock(async () => {
+      await whileHeld();
+      await sleep(holdMs);
+    });
+  }
+
+  it("uses the holder's freshly refreshed token instead of cooling the account", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const calls: string[] = [];
+    await h.manager.sync();
+    // The holder's refresh lands at ~60, after the stale read but before the timeout.
+    const held = holdLock(h, 400, async () => {
+      await sleep(60);
+      await h.accounts.updateTokens("alice", { access: "access-alice-v2", refresh: "refresh-alice-v2", expires: NOW + 3_600_000 });
+    });
+    await sleep(20);
+
+    const result = await otherProcess(h, calls).acquire();
+    await held;
+
+    assert.equal(result.kind === "ok" && result.accessToken, "access-alice-v2");
+    assert.deepEqual(calls, []);
+    assert.equal(h.state.load().accounts.alice?.cooldownUntil ?? null, null);
+  });
+
+  it("falls back to another usable account while the lock is busy", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 }), record("bob")]);
+    await h.manager.sync();
+    const held = holdLock(h, 400);
+    await sleep(20);
+
+    const result = await otherProcess(h, []).acquire();
+    await held;
+
+    assert.equal(result.kind === "ok" && result.label, "bob");
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.cooldownUntil ?? null, null);
+    assert.equal(alice?.disabled, false);
+  });
+
+  it("fails the request without penalising the account when the token is still stale", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    await h.manager.sync();
+    // Released at ~150, just after the timeout, so a cooldown write would succeed.
+    const held = holdLock(h, 150);
+    await sleep(20);
+
+    await assert.rejects(otherProcess(h, []).acquire(), /timed out/);
+    await held;
+
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.cooldownUntil ?? null, null);
+    assert.equal(alice?.disabled, false);
   });
 });
 

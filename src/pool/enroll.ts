@@ -269,6 +269,29 @@ export async function enrollFromClaudeCli(
   return record;
 }
 
+/**
+ * Label of the pooled account holding Claude Code's current refresh token, if
+ * any. Refresh tokens are single-use, so whichever side refreshes first logs
+ * the other out. Compares only; never returns or logs a token.
+ */
+export async function labelSharingClaudeCliLogin(
+  accounts: AccountStore,
+  readCredentials: () => string = readClaudeCliCredentialsRaw,
+): Promise<string | null> {
+  let refresh: string;
+  try {
+    refresh = parseClaudeCredentials(readCredentials()).claudeAiOauth.refreshToken;
+  } catch {
+    return null;
+  }
+  return (await accounts.listAccounts()).find((a) => a.oauth.refresh === refresh)?.label ?? null;
+}
+
+export function sharedLoginWarning(label: string): string {
+  return `"${label}" shares one login with Claude Code on this machine; whichever refreshes first logs the other out. `
+    + "Run `claude login` again (as this or another account) and do not re-enroll it.";
+}
+
 export type AutoEnrollStatus =
   | "enrolled"
   | "already-enrolled"

@@ -12,24 +12,24 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
+import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
 import OpenCodeClaudeBridge from "../dist/index.js";
 
 // A running OpenCode writes the live state file under its own lock while this
 // harness deletes and rewrites it, so the two raced and scenario penalties
 // leaked into the live pool. Scenarios get a private state file instead. The
-// refresh journal deliberately stays live: it guards real keychain tokens.
+// lock and refresh journal deliberately stay shared: they guard the real
+// credentials, and a private lock would let two processes spend one token.
 if (!process.env.CLAUDE_POOL_STATE_PATH) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qa-rotation-"));
   process.env.CLAUDE_POOL_STATE_PATH = path.join(dir, "rotation-state.json");
   process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 }
 const statePath = defaultStatePath();
-const state = createRotationStateStore({ path: statePath });
+const state = createRotationStateStore({ path: statePath, lockPath: defaultLockPath() });
 
 function resetState() {
   try { fs.rmSync(statePath, { force: true }); } catch {}
-  try { fs.rmSync(`${statePath}.lock`, { force: true }); } catch {}
 }
 
 function fakeClient() {

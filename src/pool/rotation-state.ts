@@ -25,7 +25,12 @@ import { randomUUID } from "node:crypto";
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { AccountState, Clock, RotationState } from "./types.js";
 
+/** Another process held the lock too long; says nothing about any account's health. */
+export class LockTimeoutError extends Error {}
+
 export interface RotationStateStoreOptions {
+  /** Defaults to `<path>.lock`. */
+  lockPath?: string;
   path: string;
   clock?: Clock;
   /** Age after which a lockfile is presumed abandoned by a crashed process. */
@@ -46,6 +51,12 @@ interface LockPayload {
 
 export function defaultRotationState(): RotationState {
   return { version: ROTATION_STATE_VERSION, activeLabel: null, accounts: {} };
+}
+
+// The lock also serialises token refreshes, so it stays with the credentials
+// and ignores CLAUDE_POOL_STATE_PATH: processes sharing accounts must share it.
+export function defaultLockPath(): string {
+  return path.join(os.homedir(), ".local", "share", "opencode-claude-bridge", "rotation-state.json.lock");
 }
 
 export function defaultStatePath(): string {
@@ -75,7 +86,7 @@ function sleep(ms: number): Promise<void> {
 
 export function createRotationStateStore(opts: RotationStateStoreOptions) {
   const statePath = opts.path;
-  const lockPath = `${statePath}.lock`;
+  const lockPath = opts.lockPath ?? `${statePath}.lock`;
   const clock: Clock = opts.clock ?? (() => Date.now());
   // Must comfortably exceed the worst-case guarded operation. A token refresh
   // runs up to 3 curl attempts at 30s each plus backoff (~100s), so a 30s
@@ -90,9 +101,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
    * operator deliberately set, masking a real failure.
    */
   function ensureDir(): void {
-    const dir = path.dirname(statePath);
-    const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (created) fs.chmodSync(dir, 0o700);
+    for (const dir of new Set([path.dirname(statePath), path.dirname(lockPath)])) {
+      const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (created) fs.chmodSync(dir, 0o700);
+    }
   }
 
   function load(): RotationState {
@@ -284,7 +296,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       }
 
       if (clock() >= deadline) {
-        throw new Error(
+        throw new LockTimeoutError(
           `[claude-pool] timed out after ${lockTimeoutMs}ms waiting for the rotation lock at ${lockPath} ` +
             `(held by pid ${existing.pid} on ${existing.hostname})`,
         );

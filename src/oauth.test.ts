@@ -111,3 +111,32 @@ describe("OAuth state verification", () => {
     }
   });
 });
+
+describe("token endpoint error bodies", () => {
+  const cloudflare = `<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>${"x".repeat(5000)}</body></html>`;
+
+  it("does not treat a firewall page as a rejected credential, and never quotes it", async () => {
+    const { parseTokenResponse } = await import("./oauth.js");
+    let message = "";
+    try {
+      parseTokenResponse(403, cloudflare, "Token refresh");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assert.match(message, /HTTP 403 with a non-JSON body \("Just a moment\.\.\."\)/);
+    assert.ok(!message.includes("<html"), message);
+    assert.ok(message.length < 200, `message is ${message.length} chars`);
+    assert.equal(isCredentialRejected(message), false);
+  });
+
+  it("still treats an OAuth invalid_grant as a rejected credential", async () => {
+    const { parseTokenResponse } = await import("./oauth.js");
+    let message = "";
+    try {
+      parseTokenResponse(400, JSON.stringify({ error: "invalid_grant", error_description: "revoked" }), "Token refresh");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assert.equal(isCredentialRejected(message), true);
+  });
+});

@@ -58,14 +58,21 @@ if (!existsSync(new URL("../dist/pool/rotation-state.js", import.meta.url))) {
   process.exit(1);
 }
 
-const { createRotationStateStore, defaultStatePath } = await import("../dist/pool/rotation-state.js");
+const { createRotationStateStore, defaultLockPath, defaultStatePath } = await import("../dist/pool/rotation-state.js");
 const { createAccountStore, createSecretBackend } = await import("../dist/pool/secret-store.js");
-const { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } =
-  await import("../dist/pool/enroll.js");
+const {
+  enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew,
+  labelSharingClaudeCliLogin, sharedLoginWarning,
+} = await import("../dist/pool/enroll.js");
+
+async function warnIfSharingLogin() {
+  const label = await labelSharingClaudeCliLogin(accounts);
+  if (label) console.log(`\nWarning: ${sharedLoginWarning(label)}`);
+}
 const { selectNext } = await import("../dist/pool/selection.js");
 
 const accounts = createAccountStore(createSecretBackend());
-const state = createRotationStateStore({ path: defaultStatePath() });
+const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
 
 /**
  * Register every enrolled account in the rotation state. The state file is
@@ -93,8 +100,10 @@ async function list() {
     return;
   }
   const s = state.load();
+  const labelWidth = Math.max(9, ...records.map((r) => r.label.length)) + 2;
+  const emailWidth = Math.max(5, ...records.map((r) => (r.email ?? "?").length)) + 2;
   console.log(
-    `${"LABEL".padEnd(10)}${"EMAIL".padEnd(30)}${"TIER".padEnd(10)}${"STATUS".padEnd(12)}TOKEN EXPIRES`,
+    ` ${"LABEL".padEnd(labelWidth)}${"EMAIL".padEnd(emailWidth)}${"TIER".padEnd(10)}${"STATUS".padEnd(12)}TOKEN EXPIRES`,
   );
   for (const r of records.sort((a, b) => a.label.localeCompare(b.label))) {
     const st = s.accounts[r.label];
@@ -105,16 +114,17 @@ async function list() {
         ? "COOLING"
         : "ready";
     console.log(
-      `${active}${r.label.padEnd(9)}${(r.email ?? "?").padEnd(30)}${(r.subscriptionType ?? "?").padEnd(10)}${status.padEnd(12)}${new Date(r.oauth.expires).toISOString()}`,
+      `${active}${r.label.padEnd(labelWidth)}${(r.email ?? "?").padEnd(emailWidth)}${(r.subscriptionType ?? "?").padEnd(10)}${status.padEnd(12)}${new Date(r.oauth.expires).toISOString()}`,
     );
     if (st?.cooldownUntil && st.cooldownUntil > Date.now()) {
-      console.log(`${" ".repeat(10)}cooling until ${when(st.cooldownUntil)} — ${st.lastReason ?? ""}`);
+      console.log(`${" ".repeat(labelWidth + 1)}cooling until ${when(st.cooldownUntil)} — ${st.lastReason ?? ""}`);
     }
     if (st?.disabled) {
-      console.log(`${" ".repeat(10)}disabled — ${st.lastReason ?? ""}`);
+      console.log(`${" ".repeat(labelWidth + 1)}disabled — ${st.lastReason ?? ""}`);
     }
   }
   console.log("\n* = active account (mirrored into opencode's anthropic slot)");
+  await warnIfSharingLogin();
 }
 
 async function enroll(label, flags = []) {
@@ -137,6 +147,7 @@ async function enroll(label, flags = []) {
     console.log("  claude login          # as the next account");
     console.log("  claude-pool enroll    # label is derived from its email");
   }
+  await warnIfSharingLogin();
 }
 
 async function auto() {
@@ -145,6 +156,7 @@ async function auto() {
     case "enrolled":
       await state.resetHealth(result.label);
       console.log(`Enrolled "${result.label}" (${result.email}).`);
+      await warnIfSharingLogin();
       break;
     case "already-enrolled":
       console.log(`Already pooled as "${result.label}".`);
@@ -226,6 +238,7 @@ async function status() {
     for (const d of selection.disabled) console.log(`  disabled ${d}`);
   }
   console.log(`state:    ${defaultStatePath()}`);
+  await warnIfSharingLogin();
 }
 
 async function remove(label) {
@@ -285,7 +298,7 @@ async function dashboard() {
   const { fetchUsage } = await import("../dist/pool/usage.js");
 
   const accounts = createAccountStore(createSecretBackend());
-  const state = createRotationStateStore({ path: defaultStatePath() });
+  const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
   // The TUI never writes to opencode's auth slot: mirroring is the plugin's job
   // and doing it here would fight with a running opencode session.
   const pool = createPool({ auth: { set: async () => {} } });

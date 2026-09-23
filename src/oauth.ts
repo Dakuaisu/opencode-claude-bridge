@@ -79,6 +79,9 @@ function runCurl(payload: string): Promise<string> {
       { timeout: 30000, encoding: "utf8", maxBuffer: 1024 * 1024 },
       (error, stdout, stderr) => (error ? reject(Object.assign(error, { stderr })) : resolve(stdout)),
     );
+    // curl can exit (DNS/TLS failure) before reading stdin; an unhandled EPIPE
+    // would crash the whole opencode process. The exit callback reports it.
+    child.stdin?.on("error", () => {});
     child.stdin?.end(payload);
   });
 }
@@ -122,21 +125,33 @@ async function curlPost(
   };
 }
 
-export function extractOAuthErrorDetail(body: string): string {
+/** The OAuth server's error text, or null for a non-JSON (proxy/firewall) body, which is never quoted. */
+export function extractOAuthErrorDetail(body: string): string | null {
+  let parsed: {
+    error?: { message?: string; type?: string } | string;
+    error_description?: string;
+    message?: string;
+  };
   try {
-    const parsed = JSON.parse(body) as {
-      error?: { message?: string; type?: string } | string;
-      error_description?: string;
-      message?: string;
-    };
-    if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
-    if (parsed.error && typeof parsed.error === "object" && parsed.error.message?.trim()) {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const pick = (): string => {
+    if (typeof parsed?.error === "string" && parsed.error.trim()) return parsed.error.trim();
+    if (parsed?.error && typeof parsed.error === "object" && parsed.error.message?.trim()) {
       return parsed.error.message.trim();
     }
-    if (parsed.error_description?.trim()) return parsed.error_description.trim();
-    if (parsed.message?.trim()) return parsed.message.trim();
-  } catch {}
-  return body.trim();
+    if (parsed?.error_description?.trim()) return parsed.error_description.trim();
+    if (parsed?.message?.trim()) return parsed.message.trim();
+    return "unrecognised error body";
+  };
+  return pick().slice(0, 300);
+}
+
+function pageTitle(body: string): string {
+  const title = body.match(/<title[^>]*>([^<]{1,80})/i)?.[1]?.trim();
+  return title ? ` ("${title}")` : "";
 }
 
 /** Used when a response carries valid tokens but no usable lifetime: refresh again soon rather than lose them. */
@@ -144,7 +159,15 @@ export const FALLBACK_TOKEN_LIFETIME_MS = 5 * 60_000;
 
 export function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
   if (status !== 200) {
-    throw new Error(`${label} failed (${status}): ${extractOAuthErrorDetail(body)}`);
+    const detail = extractOAuthErrorDetail(body);
+    if (detail === null) {
+      // Deliberately not "<label> failed (NNN)": that prefix marks a rejected
+      // credential, and a page that never reached the token server is not one.
+      throw new Error(
+        `${label}: HTTP ${status} with a non-JSON body${pageTitle(body)}, likely blocked before reaching the token server`,
+      );
+    }
+    throw new Error(`${label} failed (${status}): ${detail}`);
   }
   // Errors here must not quote the body: a 200 body is where the tokens are.
   let data: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };

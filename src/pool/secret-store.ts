@@ -56,6 +56,7 @@ function runSecurityCommand(line: string): Promise<void> {
       { timeout: SECURITY_TIMEOUT_MS, encoding: "utf8" },
       (error) => (error ? reject(error) : resolve()),
     );
+    child.stdin?.on("error", () => {}); // see runCurl: an early exit must not crash the process
     child.stdin?.end(`${line}\n`);
   });
 }
