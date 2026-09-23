@@ -13,10 +13,56 @@
  *   claude-pool list
  */
 
-import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
-import { createAccountStore, createSecretBackend } from "../dist/pool/secret-store.js";
-import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } from "../dist/pool/enroll.js";
-import { selectNext } from "../dist/pool/selection.js";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const USAGE = [
+  "usage: claude-pool <command>",
+  "",
+  "  enroll [label] [--replace]  add the account Claude CLI is logged into",
+  "                              (label defaults to the account's email name)",
+  "  auto                        enroll the logged-in account if the pool has not seen it",
+  "  install-hook                print a shell function that runs `auto` after `claude login`",
+  "  whoami                      show which account Claude CLI is logged into",
+  "  list                        show every enrolled account and its status",
+  "  status                      show active account and what rotation picks next",
+  "  dashboard                   interactive manager (prints the status when not in a terminal)",
+  "  enable <label>              re-enable one account (clears its cooldown or disabled flag)",
+  "  remove <label>              drop an account from the pool",
+  "  clear-cooldowns             re-enable every account (clears all cooldowns and disabled flags)",
+  "  help                        show this help",
+  "",
+  "Adding accounts (repeat for as many as you like):",
+  "  claude login   # as the account you want to add",
+  "  claude-pool enroll",
+].join("\n");
+
+const [command, ...rest] = process.argv.slice(2);
+const flags = rest.filter((a) => a.startsWith("--"));
+const arg = rest.find((a) => !a.startsWith("--"));
+
+if (["help", "--help", "-h"].includes(command) || rest.includes("--help") || rest.includes("-h")) {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (!command) {
+  console.error(USAGE);
+  process.exit(1);
+}
+
+// Static imports would fail with a bare ERR_MODULE_NOT_FOUND stack before any
+// of this file runs, which says nothing about the actual fix.
+if (!existsSync(new URL("../dist/pool/rotation-state.js", import.meta.url))) {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  console.error(`claude-pool: the plugin is not built yet. Run \`npm run build\` in ${root} first.`);
+  process.exit(1);
+}
+
+const { createRotationStateStore, defaultStatePath } = await import("../dist/pool/rotation-state.js");
+const { createAccountStore, createSecretBackend } = await import("../dist/pool/secret-store.js");
+const { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } =
+  await import("../dist/pool/enroll.js");
+const { selectNext } = await import("../dist/pool/selection.js");
 
 const accounts = createAccountStore(createSecretBackend());
 const state = createRotationStateStore({ path: defaultStatePath() });
@@ -196,6 +242,20 @@ async function remove(label) {
   console.log(`Removed "${label}".`);
 }
 
+async function enable(label) {
+  if (!label) {
+    console.error("usage: claude-pool enable <label>");
+    process.exit(1);
+  }
+  if ((await accounts.getAccount(label)) === null) {
+    const known = (await accounts.listAccounts()).map((a) => a.label);
+    console.error(`No enrolled account named "${label}". Enrolled: ${known.join(", ") || "none"}`);
+    process.exit(1);
+  }
+  await state.resetHealth(label);
+  console.log(`Re-enabled "${label}". This clears local state only; a spent quota window will cool it again.`);
+}
+
 async function clearCooldowns() {
   await state.withLock((s) => {
     for (const account of Object.values(s.accounts)) {
@@ -234,8 +294,13 @@ async function dashboard() {
     pool,
     accounts,
     state,
-    enroll: async (label) => {
-      const record = await enrollFromClaudeCli({ accounts, label, resolveEmail: true });
+    enroll: async (label, options) => {
+      const record = await enrollFromClaudeCli({
+        accounts,
+        label,
+        resolveEmail: true,
+        replace: options?.replace === true,
+      });
       await state.resetHealth(record.label);
       return record.label;
     },
@@ -262,9 +327,6 @@ async function dashboard() {
   await tui.start();
 }
 
-const [command, ...rest] = process.argv.slice(2);
-const flags = rest.filter((a) => a.startsWith("--"));
-const arg = rest.find((a) => !a.startsWith("--"));
 try {
   switch (command) {
     case "enroll": await enroll(arg, flags); break;
@@ -274,26 +336,11 @@ try {
     case "whoami": await whoami(); break;
     case "auto": await auto(); break;
     case "install-hook": await installHook(); break;
+    case "enable": await enable(arg); break;
     case "remove": await remove(arg); break;
     case "clear-cooldowns": await clearCooldowns(); break;
     default:
-      console.log([
-        "usage: claude-pool <command>",
-        "",
-        "  enroll [label] [--replace]  add the account Claude CLI is logged into",
-        "                              (label defaults to the account's email name)",
-        "  auto                        enroll the logged-in account if the pool has not seen it",
-        "  install-hook                print a shell function that runs `auto` after `claude login`",
-        "  whoami                      show which account Claude CLI is logged into",
-        "  list                        show every enrolled account and its status",
-        "  status                      show active account and what rotation picks next",
-        "  remove <label>              drop an account from the pool",
-        "  clear-cooldowns             re-enable everything after a rate-limit storm",
-        "",
-        "Adding accounts (repeat for as many as you like):",
-        "  claude login   # as the account you want to add",
-        "  claude-pool enroll",
-      ].join("\n"));
+      console.error(`claude-pool: unknown command "${command}"\n\n${USAGE}`);
       process.exit(1);
   }
 } catch (err) {
