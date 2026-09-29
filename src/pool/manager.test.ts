@@ -58,6 +58,7 @@ interface Harness {
   accounts: ReturnType<typeof createAccountStore>;
   refreshCalls: string[];
   mirrored: PoolOAuthTokens[];
+  disabledEvents: string[];
   journalPath: string;
   statePath: string;
   setNow: (n: number) => void;
@@ -87,12 +88,16 @@ function harness(
 
   const refreshCalls: string[] = [];
   const mirrored: PoolOAuthTokens[] = [];
+  const disabledEvents: string[] = [];
 
   const manager = createRotationManager({
     accounts,
     state,
     clock,
     journalPath,
+    onAccountDisabled: (label) => {
+      disabledEvents.push(label);
+    },
     refreshFn: (token) => {
       refreshCalls.push(token);
       if (refreshImpl) return refreshImpl(token);
@@ -114,6 +119,7 @@ function harness(
     accounts,
     refreshCalls,
     mirrored,
+    disabledEvents,
     journalPath,
     statePath,
     setNow: (n) => {
@@ -579,5 +585,65 @@ describe("formatWait", () => {
     assert.equal(formatWait(119 * 60_000), "1h 59m");
     assert.equal(formatWait(51 * 3_600_000), "2d 3h");
     assert.equal(formatWait(48 * 3_600_000), "2d");
+  });
+});
+
+describe("disabled-account notification", () => {
+  it("reports a credential missing from the keychain", async (t) => {
+    const h = harness(t, [record("alice")]);
+    await h.state.ensureAccount("ghost");
+    await h.state.setActive("ghost");
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind === "ok" && result.label, "alice");
+    assert.deepEqual(h.disabledEvents, ["ghost"]);
+  });
+
+  it("reports a rejected refresh but not a transient one", async (t) => {
+    const rejected = harness(t, [record("alice", { expires: NOW - 1 })], () => {
+      throw new Error("Token refresh failed (400): invalid_grant");
+    });
+    await rejected.manager.acquire();
+    assert.deepEqual(rejected.disabledEvents, ["alice"]);
+
+    const transient = harness(t, [record("alice", { expires: NOW - 1 })], () => {
+      throw new Error("Token endpoint unreachable: request timed out");
+    });
+    await transient.manager.acquire();
+    assert.deepEqual(transient.disabledEvents, []);
+  });
+
+  it("reports a ROTATE_DISABLE decision", async (t) => {
+    const h = harness(t, [record("alice")]);
+    await h.manager.applyDecision("alice", {
+      action: "ROTATE_DISABLE",
+      reason: "revoked",
+      source: "status",
+    });
+    assert.deepEqual(h.disabledEvents, ["alice"]);
+  });
+
+  it("still disables the account when the listener throws", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pool-manager-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const state = createRotationStateStore({ path: path.join(root, "state.json"), lockPollMs: 1 });
+    const manager = createRotationManager({
+      accounts: createAccountStore(memoryBackend({ alice: JSON.stringify(record("alice")) })),
+      state,
+      clock: () => NOW,
+      journalPath: path.join(root, "journal.json"),
+      refreshFn: () => {
+        throw new Error("unused");
+      },
+      mirrorFn: async () => {},
+      onAccountDisabled: () => {
+        throw new Error("toast failed");
+      },
+    });
+
+    await manager.applyDecision("alice", { action: "ROTATE_DISABLE", reason: "revoked", source: "status" });
+
+    assert.equal(state.load().accounts.alice?.disabled, true);
   });
 });

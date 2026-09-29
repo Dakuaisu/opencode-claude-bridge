@@ -72,6 +72,8 @@ export interface ManagerOptions {
   journalPath?: string;
   /** Refresh when the access token expires within this window. */
   expiryBufferMs?: number;
+  /** Called after an account is disabled. Must not throw; errors are swallowed. */
+  onAccountDisabled?: (label: string, reason: string) => void;
 }
 
 interface JournalEntry {
@@ -163,6 +165,15 @@ export function createRotationManager(opts: ManagerOptions) {
   const clock: Clock = opts.clock ?? (() => Date.now());
   const journalPath = opts.journalPath ?? defaultJournalPath();
   const expiryBufferMs = opts.expiryBufferMs ?? 60_000;
+
+  async function disable(label: string, reason: string): Promise<void> {
+    await state.markDisabled(label, reason);
+    try {
+      opts.onAccountDisabled?.(label, reason);
+    } catch {
+      // A notification failure must not undo or abort the state change.
+    }
+  }
 
   /** Collapses concurrent in-process refreshes of the same account. */
   const inFlight = new Map<string, Promise<PoolOAuthTokens>>();
@@ -339,7 +350,7 @@ export function createRotationManager(opts: ManagerOptions) {
     if (!record) {
       // Enrolled in state but missing from the keychain: disable rather than
       // spin, so selection moves on instead of picking it again.
-      await state.markDisabled(label, "credentials missing from keychain");
+      await disable(label, "credentials missing from keychain");
       return acquire(exclude);
     }
 
@@ -355,7 +366,7 @@ export function createRotationManager(opts: ManagerOptions) {
           // instead, or one transient outage disables every account in turn and
           // wedges the pool with no automatic recovery.
           if (isCredentialRejected(detail)) {
-            await state.markDisabled(label, `refresh rejected: ${detail}`);
+            await disable(label, `refresh rejected: ${detail}`);
           } else {
             await state.markCooldown(
               label,
@@ -418,7 +429,7 @@ export function createRotationManager(opts: ManagerOptions) {
         await releaseIfActive();
         break;
       case "ROTATE_DISABLE":
-        await state.markDisabled(label, decision.reason);
+        await disable(label, decision.reason);
         await releaseIfActive();
         break;
       case "RETRY_SAME":
