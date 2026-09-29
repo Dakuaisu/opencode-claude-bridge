@@ -99,7 +99,7 @@ export function createKeychainBackend(
   return {
     async get(label: string): Promise<string | null> {
       try {
-        return await runSecurity([
+        const output = await runSecurity([
           "find-generic-password",
           "-s",
           service,
@@ -107,8 +107,11 @@ export function createKeychainBackend(
           label,
           "-w",
         ]);
-      } catch {
-        return null;
+        return output.endsWith("\n") ? output.slice(0, -1) : output;
+      } catch (error) {
+        // A locked keychain or timeout is not "missing": missing gets an account disabled.
+        if (isMissingKeychainItem(error)) return null;
+        throw new Error(`Failed to read keychain account "${label}"`);
       }
     },
 
@@ -327,8 +330,12 @@ export function createAccountStore(backend: SecretBackend) {
     async listAccounts(): Promise<AccountRecord[]> {
       const accounts: AccountRecord[] = [];
       for (const label of await backend.list()) {
-        const account = await getAccount(label);
-        if (account !== null) accounts.push(account);
+        try {
+          const account = await getAccount(label);
+          if (account !== null) accounts.push(account);
+        } catch (error) {
+          console.error(`[claude-pool] skipping "${label}": ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return accounts;
     },
