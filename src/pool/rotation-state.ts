@@ -414,6 +414,13 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       });
     },
 
+    async forget(label: string): Promise<void> {
+      await withLock((state) => {
+        delete state.accounts[label];
+        if (state.activeLabel === label) state.activeLabel = null;
+      });
+    },
+
     async markSuccess(label: string): Promise<void> {
       await mutateAccount(label, (account, now) => {
         account.cooldownUntil = null;
