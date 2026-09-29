@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
@@ -544,6 +544,22 @@ function readCachedClaudePromptCache(): ClaudeSystemPromptCache | null {
   }
 }
 
+let promptCacheMtime = -1;
+let promptCache: ClaudeSystemPromptCache | null = null;
+
+// Re-read when the file changes, so a fresh capture applies without a restart.
+function currentPromptCache(): ClaudeSystemPromptCache | null {
+  let mtime = 0;
+  try {
+    mtime = statSync(SYSTEM_PROMPT_CACHE_PATH).mtimeMs;
+  } catch {}
+  if (mtime !== promptCacheMtime) {
+    promptCacheMtime = mtime;
+    promptCache = mtime ? readCachedClaudePromptCache() : null;
+  }
+  return promptCache;
+}
+
 function getStableDeviceId(): string {
   let who = "unknown";
   try {
@@ -610,8 +626,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const savedApiKey = process.env.ANTHROPIC_API_KEY;
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
-  const cachedClaudePromptCache = readCachedClaudePromptCache();
-  const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
 
   // Multi-account pool. Inactive until the user enrolls an account, in which
   // case every path below falls back to the original single-account behaviour.
@@ -879,6 +893,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   (s: { text?: string }) =>
                     s.text?.startsWith("x-anthropic-billing-header:"),
                 );
+                const cachedClaudePromptCache = currentPromptCache();
+                const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
                 let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
                 if (!hasBilling) {
                   parsed.system.unshift({
