@@ -6,6 +6,7 @@ import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
   parseAuthCode,
+  parsePastedState,
   refreshTokens,
   startOAuthCallbackServer,
 } from "./oauth.js";
@@ -1142,7 +1143,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             }
 
             if (callbackServer) {
-              const { url, manualUrl, verifier, port } = callbackServer;
+              const { url, manualUrl, verifier, port, state } = callbackServer;
               const redirectUri = `http://localhost:${port}/callback`;
 
               // Best-effort browser open
@@ -1179,6 +1180,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       return { type: "success" as const, ...tokens };
                     }
 
+                    const pastedState = parsePastedState(manualInput);
+                    if (pastedState !== null && pastedState !== state) {
+                      console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                      callbackServer?.close();
+                      return { type: "failed" as const };
+                    }
                     const code = parseAuthCode(manualInput);
                     if (!code) {
                       console.error("[opencode-oauth] No authorization code received");
@@ -1202,7 +1209,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             // Fallback: no callback server — use manual redirect URL flow only.
             // This is the path for environments where we can't bind localhost.
-            const { url, verifier } = createAuthorizationRequest();
+            const { url, verifier, state } = createAuthorizationRequest();
 
             openBrowser(url);
 
@@ -1212,6 +1219,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               method: "code" as const,
               callback: async (code: string) => {
                 try {
+                  const pastedState = parsePastedState(code);
+                  if (pastedState !== null && pastedState !== state) {
+                    console.error("[opencode-oauth] Pasted code belongs to a different login attempt (state mismatch)");
+                    return { type: "failed" as const };
+                  }
                   // redirect_uri defaults to MANUAL_REDIRECT_URL in exchangeCodeForTokens
                   const tokens = await exchangeCodeForTokens(parseAuthCode(code), verifier);
                   await storeAuth(client, tokens);
