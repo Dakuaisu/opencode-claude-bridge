@@ -133,6 +133,13 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
     modalities: { input: ["text", "image"], output: ["text"] },
     cost: { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
   },
+  "claude-sonnet-5-5": {
+    name: "Claude Sonnet 5.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  },
   "claude-sonnet-5": {
     name: "Claude Sonnet 5",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
@@ -251,6 +258,24 @@ const ADAPTIVE_THINKING_MODELS = [
 
 export function supportsAdaptiveThinking(model: unknown): boolean {
   return typeof model === "string" && ADAPTIVE_THINKING_MODELS.some((m) => model.includes(m));
+}
+
+const EFFORTS_ABOVE_HIGH = new Set(["xhigh", "max"]);
+
+// Sonnet 5.5 rejects thinking:{type:"disabled"} with a 400; "between_tools" is its lowest
+// thinking setting, accepts no other thinking field, and 400s at xhigh/max effort.
+export function normalizeThinkingForSonnet55(parsed: {
+  model?: unknown;
+  thinking?: { type?: string; [key: string]: unknown };
+  output_config?: { effort?: string; [key: string]: unknown };
+}): void {
+  if (typeof parsed.model !== "string" || !parsed.model.startsWith("claude-sonnet-5-5")) return;
+  if (parsed.thinking?.type === "disabled") parsed.thinking = { type: "between_tools" };
+  if (parsed.thinking?.type !== "between_tools") return;
+  parsed.thinking = { type: "between_tools" };
+  if (parsed.output_config?.effort && EFFORTS_ABOVE_HIGH.has(parsed.output_config.effort)) {
+    parsed.output_config.effort = "high";
+  }
 }
 
 export function stripSystemCacheControl(
@@ -843,6 +868,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     parsed.output_config = { effort: DEFAULT_EFFORT };
                   }
                 }
+                normalizeThinkingForSonnet55(parsed);
 
                 const profile = auth.access
                   ? await fetchOAuthProfile(auth.access)
