@@ -34,6 +34,33 @@ async function runSecurity(args: string[]): Promise<string> {
   return stdout;
 }
 
+// `security -i` writes a TRUNCATED secret for lines over 4095 chars, then fails.
+const SECURITY_MAX_LINE = 4000;
+
+function quoteForSecurity(value: string): string {
+  if (/["\\\r\n]/.test(value)) {
+    throw new Error(`Unsupported character in keychain name "${value}"`);
+  }
+  return `"${value}"`;
+}
+
+/** Runs one `security` command read from stdin, keeping secrets out of argv. */
+function runSecurityCommand(line: string): Promise<void> {
+  if (line.length > SECURITY_MAX_LINE) {
+    return Promise.reject(new Error("keychain command exceeds the safe line length"));
+  }
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "security",
+      ["-i"],
+      { timeout: SECURITY_TIMEOUT_MS, encoding: "utf8" },
+      (error) => (error ? reject(error) : resolve()),
+    );
+    child.stdin?.on("error", () => {}); // see runCurl: an early exit must not crash the process
+    child.stdin?.end(`${line}\n`);
+  });
+}
+
 function decodeDumpValue(value: string): string | null {
   try {
     return JSON.parse(value) as string;
@@ -117,20 +144,11 @@ export function createKeychainBackend(
 
     async set(label: string, value: string): Promise<void> {
       try {
-        await runSecurity([
-          "add-generic-password",
-          "-U",
-          "-s",
-          service,
-          "-a",
-          label,
-          "-l",
-          `${service}:${label}`,
-          "-D",
-          "Claude account pool entry",
-          "-w",
-          value,
-        ]);
+        const hex = Buffer.from(value, "utf8").toString("hex");
+        await runSecurityCommand(
+          `add-generic-password -U -s ${quoteForSecurity(service)} -a ${quoteForSecurity(label)}`
+            + ` -l ${quoteForSecurity(`${service}:${label}`)} -D "Claude account pool entry" -X ${hex}`,
+        );
       } catch {
         throw new Error(`Failed to store keychain account "${label}"`);
       }
