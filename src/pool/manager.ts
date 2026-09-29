@@ -368,6 +368,11 @@ export function createRotationManager(opts: ManagerOptions) {
     label: string,
     decision: RotationDecision,
   ): Promise<void> {
+    // Deferred penalties land after the pool has switched; don't clear the new pick.
+    const releaseIfActive = () =>
+      state.withLock((s) => {
+        if (s.activeLabel === label) s.activeLabel = null;
+      });
     switch (decision.action) {
       case "ROTATE_COOLDOWN":
         await state.markCooldown(
@@ -375,11 +380,11 @@ export function createRotationManager(opts: ManagerOptions) {
           decision.until ?? clock(),
           decision.reason,
         );
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "ROTATE_DISABLE":
         await state.markDisabled(label, decision.reason);
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "RETRY_SAME":
       case "PASS_THROUGH":
