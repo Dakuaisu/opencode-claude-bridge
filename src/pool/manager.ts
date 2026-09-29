@@ -406,6 +406,7 @@ export function createRotationManager(opts: ManagerOptions) {
           label,
           decision.until ?? clock(),
           decision.reason,
+          decision.windows,
         );
         await releaseIfActive();
         break;
