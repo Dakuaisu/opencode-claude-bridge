@@ -364,10 +364,17 @@ async function refreshAuth(
   }
 
   if (fresh) {
-    await storeAuth(client, fresh);
+    // In memory first: the old refresh token is already spent, so if persisting
+    // fails these are the only valid credentials this process has.
     auth.access = fresh.access;
     auth.refresh = fresh.refresh;
     auth.expires = fresh.expires;
+    try {
+      await storeAuth(client, fresh);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message.split("\n")[0]!.slice(0, 200) : String(err);
+      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; they stay valid in memory until restart: ${detail}`);
+    }
     return fresh.access;
   }
 
