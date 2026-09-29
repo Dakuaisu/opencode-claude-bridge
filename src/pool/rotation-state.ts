@@ -25,6 +25,9 @@ import { randomUUID } from "node:crypto";
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { AccountState, Clock, RotationState } from "./types.js";
 
+/** Another process held the lock too long; says nothing about any account's health. */
+export class LockTimeoutError extends Error {}
+
 export interface RotationStateStoreOptions {
   path: string;
   clock?: Clock;
@@ -282,7 +285,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       }
 
       if (clock() >= deadline) {
-        throw new Error(
+        throw new LockTimeoutError(
           `[claude-pool] timed out after ${lockTimeoutMs}ms waiting for the rotation lock at ${lockPath} ` +
             `(held by pid ${existing.pid} on ${existing.hostname})`,
         );

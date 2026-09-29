@@ -36,6 +36,20 @@ export function createPool(client: PoolClient): RotationManager {
   });
 }
 
+/** 503 + retry-after, which clients retry: another process holds the lock mid-refresh. */
+export function buildPoolBusyResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: {
+        type: "overloaded_error",
+        message: "Claude pool is busy: another process is refreshing a token. Retrying shortly.",
+      },
+    }),
+    { status: 503, headers: { "content-type": "application/json", "retry-after": "5" } },
+  );
+}
+
 /**
  * Build the fail-fast response for a fully-exhausted pool.
  *
