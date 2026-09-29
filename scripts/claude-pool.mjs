@@ -80,9 +80,9 @@ async function enroll(label, flags = []) {
   // Fresh credentials mean any prior disable/cooldown is stale. Without this,
   // re-enrolling a revoked account reports success while rotation keeps
   // skipping it.
-  await state.resetHealth(label);
+  await state.resetHealth(record.label);
   console.log(
-    `Enrolled "${label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
+    `Enrolled "${record.label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
   );
   const total = (await accounts.listAccounts()).length;
   console.log(`Pool now holds ${total} account${total === 1 ? "" : "s"}.`);

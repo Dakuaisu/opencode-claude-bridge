@@ -184,6 +184,55 @@ describe("duplicate enrollment", () => {
   });
 });
 
+describe("re-enrolling after a re-login", () => {
+  const relogin = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "sk-ant-oat01-new",
+      refreshToken: "sk-ant-ort01-new",
+      expiresAt: NOW + 3_600_000,
+      subscriptionType: "max",
+    },
+  });
+
+  it("refreshes the existing entry for the same email instead of refusing", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW - 5000, "alice@example.com"),
+    );
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@example.com",
+      readCredentials: () => relogin,
+    });
+
+    assert.equal(record.label, "alice");
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-new");
+  });
+
+  it("refuses a second label for an email that is already enrolled", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com"),
+    );
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        label: "work",
+        clock: () => NOW,
+        resolveEmail: async () => "alice@example.com",
+        readCredentials: () => relogin,
+      }),
+      (err: Error) => err instanceof EnrollmentError && /already enrolled as "alice"/.test(err.message),
+    );
+    assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
 describe("automatic enrollment", () => {
   const cli = (refresh: string, expiresInMs = 3_600_000) =>
     JSON.stringify({
@@ -270,6 +319,24 @@ describe("automatic enrollment", () => {
     assert.equal(result.status, "enrolled");
     assert.equal(result.label, "bob-2");
     assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("recognises the same account by email after the tokens have diverged", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "Alice@Example.com"),
+    );
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-rotated"),
+      resolveEmail: async () => "alice@example.com",
+    });
+
+    assert.equal(result.status, "already-enrolled");
+    assert.equal(result.label, "alice");
+    assert.equal((await store.listAccounts()).length, 1);
   });
 
   it("skips accounts whose email cannot be resolved", async () => {
