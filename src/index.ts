@@ -13,12 +13,12 @@ import {
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
   BETA_FLAGS,
-  CLI_VERSION,
+  getCliVersion,
   OAUTH_BETA_FLAG,
   ANTHROPIC_VERSION,
   BILLING_CCH,
   STAINLESS_HEADERS,
-  USER_AGENT,
+  getUserAgent,
   PROFILE_URL,
   CLI_BUILD_ID,
   ENTRYPOINT,
@@ -551,8 +551,8 @@ function buildBillingHeader(
   const suffix = dynamicFingerprint
     || cachedClaudePromptCache?.billing?.ccVersionSuffix
     || CLI_BUILD_ID;
-  const ccVersion = cachedClaudePromptCache?.billing?.ccVersion
-    || `${CLI_VERSION}.${suffix}`;
+  // Deliberately ignores the capture: the API gates model access on this.
+  const ccVersion = `${getCliVersion()}.${suffix}`;
   const ccEntrypoint = cachedClaudePromptCache?.billing?.ccEntrypoint || ENTRYPOINT;
   return `x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=${ccEntrypoint}; cch=${cch};`;
 }
@@ -567,7 +567,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
         headers: {
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
-          "user-agent": USER_AGENT,
+          "user-agent": getUserAgent(),
           "anthropic-beta": OAUTH_BETA_FLAG,
         },
       });
@@ -754,7 +754,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.delete("x-session-affinity");
             headers.delete("x-session-id");
             if (!headers.has("accept")) headers.set("accept", "application/json");
-            headers.set("user-agent", USER_AGENT);
+            headers.set("user-agent", getUserAgent());
             headers.set("x-app", "cli");
             headers.set("x-claude-code-session-id", sessionId);
             headers.set("anthropic-version", ANTHROPIC_VERSION);
