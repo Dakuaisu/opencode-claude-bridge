@@ -198,11 +198,15 @@ async function status() {
 
 async function remove(label) {
   if (!label) throw new Error("usage: claude-pool remove <label>");
+  const inKeychain = (await accounts.getAccount(label)) !== null;
+  const inState = Object.hasOwn(state.load().accounts, label);
+  if (!inKeychain && !inState) {
+    const known = (await accounts.listAccounts()).map((a) => a.label);
+    console.error(`No account named "${label}". Enrolled: ${known.join(", ") || "none"}`);
+    process.exit(1);
+  }
   await accounts.removeAccount(label);
-  await state.withLock((s) => {
-    delete s.accounts[label];
-    if (s.activeLabel === label) s.activeLabel = null;
-  });
+  await state.forget(label);
   console.log(`Removed "${label}".`);
 }
 
