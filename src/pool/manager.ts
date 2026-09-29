@@ -198,19 +198,26 @@ export function createRotationManager(opts: ManagerOptions) {
    * before persisting. Without this, those tokens — the only valid ones,
    * because the server already invalidated their predecessors — would be lost.
    */
-  async function replayJournal(): Promise<boolean> {
+  // Caller must hold the lock, or another process can spend the dead keychain token.
+  async function commitPendingJournalLocked(): Promise<JournalEntry | null> {
     const entry = readJournal();
-    if (!entry) return false;
+    if (!entry) return null;
+    await accounts.updateTokens(entry.label, entry.tokens);
+    clearJournal();
+    console.error(
+      `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
+    );
+    return entry;
+  }
+
+  async function replayJournal(): Promise<boolean> {
+    // Cheap pre-check so the common case (no journal) costs no lock.
+    if (!readJournal()) return false;
     try {
-      await accounts.updateTokens(entry.label, entry.tokens);
-      clearJournal();
-      console.error(
-        `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
-      );
-      return true;
+      return (await state.withLock(commitPendingJournalLocked)) !== null;
     } catch (err) {
       console.error(
-        `[claude-pool] failed to replay refresh journal for "${entry.label}": ${
+        `[claude-pool] failed to replay refresh journal: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -256,6 +263,8 @@ export function createRotationManager(opts: ManagerOptions) {
 
     const task = (async (): Promise<PoolOAuthTokens> => {
       return state.withLock(async () => {
+        // Callers may reach this without going through acquire()'s journal replay.
+        await commitPendingJournalLocked();
         // Another process may have refreshed while we waited for the lock.
         // Re-read inside the critical section before burning our token.
         const current = await accounts.getAccount(label);

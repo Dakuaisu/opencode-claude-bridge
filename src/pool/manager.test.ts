@@ -264,7 +264,61 @@ describe("rotation manager journal replay", () => {
     const h = harness(t, [record("alice")]);
     assert.equal(await h.manager.replayJournal(), false);
   });
+
+  it("keeps the lock held until the replayed tokens are committed", async (t) => {
+    const h = harness(t, [record("alice")]);
+    writePendingJournal(h.journalPath);
+    const events: string[] = [];
+    const originalUpdate = h.accounts.updateTokens.bind(h.accounts);
+    h.accounts.updateTokens = async (label, tokens) => {
+      events.push("commit-start");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const updated = await originalUpdate(label, tokens);
+      events.push("commit-end");
+      return updated;
+    };
+
+    const replay = h.manager.replayJournal();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Stands in for another OpenCode process contending for the same lock.
+    const otherProcess = h.state.withLock(() => {
+      events.push("other-process-lock");
+    });
+    await Promise.all([replay, otherProcess]);
+
+    assert.deepEqual(events, ["commit-start", "commit-end", "other-process-lock"]);
+  });
+
+  it("refreshLabel uses a pending journal instead of spending the dead keychain token", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })], (token) => {
+      if (token === "refresh-alice") throw new Error("Token refresh failed (400): invalid_grant");
+      throw new Error(`unexpected refresh with ${token}`);
+    });
+    writePendingJournal(h.journalPath);
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.refresh, "recovered-refresh");
+    assert.deepEqual(h.refreshCalls, []);
+    assert.equal(fs.existsSync(h.journalPath), false);
+  });
 });
+
+function writePendingJournal(journalPath: string): void {
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.writeFileSync(
+    journalPath,
+    JSON.stringify({
+      label: "alice",
+      tokens: {
+        access: "recovered-access",
+        refresh: "recovered-refresh",
+        expires: NOW + 3_600_000,
+      },
+      writtenAt: NOW - 5_000,
+    }),
+  );
+}
 
 describe("rotation manager rotation", () => {
   it("a penalty applied after the switch keeps the new active account", async (t) => {
