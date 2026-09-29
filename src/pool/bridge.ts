@@ -1,6 +1,6 @@
 import { refreshTokens } from "../oauth.js";
 import { createRotationManager } from "./manager.js";
-import { createRotationStateStore, defaultStatePath } from "./rotation-state.js";
+import { createRotationStateStore, defaultLockPath, defaultStatePath } from "./rotation-state.js";
 import { createAccountStore, createSecretBackend } from "./secret-store.js";
 import type { RotationManager } from "./manager.js";
 import type { PoolOAuthTokens } from "./types.js";
@@ -16,7 +16,7 @@ export interface PoolClient {
 
 export function createPool(client: PoolClient): RotationManager {
   const accounts = createAccountStore(createSecretBackend());
-  const state = createRotationStateStore({ path: defaultStatePath() });
+  const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
 
   return createRotationManager({
     accounts,
