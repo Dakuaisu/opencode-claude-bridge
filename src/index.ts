@@ -435,11 +435,13 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
 
 /** Build deduplicated beta flags string. */
 function buildBetaFlags(existing: string): string {
-  const required = BETA_FLAGS.split(",").map((b) => b.trim()).filter(Boolean);
-  const withoutSpecials = required.filter(
+  // Dropping caller flags makes the API reject newer body fields they gate.
+  const split = (s: string) => s.split(",").map((b) => b.trim()).filter(Boolean);
+  const merged = [...split(BETA_FLAGS), ...split(existing)];
+  const withoutSpecials = merged.filter(
     (beta) => beta !== "claude-code-20250219" && beta !== OAUTH_BETA_FLAG,
   );
-  return ["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials].join(",");
+  return [...new Set(["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials])].join(",");
 }
 
 /** Deduplicate repeated Claude Code prefix in a text block. */
