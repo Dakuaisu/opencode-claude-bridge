@@ -63,9 +63,10 @@ export function getCliVersion(): string {
 export const CLIENT_ID =
   process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+// claude.ai serves this path behind a Cloudflare challenge that always 403s.
 export const PROFILE_URL =
   process.env.ANTHROPIC_PROFILE_URL ||
-  "https://claude.ai/api/oauth/profile";
+  "https://api.anthropic.com/api/oauth/profile";
 
 export const TOKEN_URL =
   process.env.ANTHROPIC_TOKEN_URL ||

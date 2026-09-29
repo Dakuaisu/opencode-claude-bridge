@@ -579,6 +579,9 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
   })();
 
   oauthProfileCache.set(accessToken, pending);
+  void pending.then((profile) => {
+    if (!profile) oauthProfileCache.delete(accessToken);
+  });
   return pending;
 }
 
@@ -765,6 +768,17 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
 
             // ── Body ──
+            const userIdFor = async (token: string): Promise<string | undefined> => {
+              const profile = await fetchOAuthProfile(token);
+              if (!profile?.account?.uuid) return undefined;
+              return JSON.stringify({
+                device_id: deviceId,
+                account_uuid: profile.account.uuid,
+                session_id: sessionId,
+              });
+            };
+            let ownsUserId = false;
+
             let body = init?.body;
             if (body && typeof body === "string") {
               try {
@@ -823,16 +837,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   }
                 }
 
-                const profile = auth.access
-                  ? await fetchOAuthProfile(auth.access)
-                  : null;
                 if (!parsed.metadata) parsed.metadata = {};
-                if (!parsed.metadata.user_id && profile?.account?.uuid) {
-                  parsed.metadata.user_id = JSON.stringify({
-                    device_id: deviceId,
-                    account_uuid: profile.account.uuid,
-                    session_id: sessionId,
-                  });
+                if (!parsed.metadata.user_id) {
+                  ownsUserId = true;
+                  const userId = await userIdFor(accessToken);
+                  if (userId) parsed.metadata.user_id = userId;
                 }
 
                 // Compute dynamic fingerprint from the first user message
@@ -918,7 +927,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {}
+              } catch {
+                ownsUserId = false;
+              }
             }
 
             // ── URL: add ?beta=true ──
@@ -1029,6 +1040,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 activeLabel = next.label;
                 outHeaders["authorization"] = `Bearer ${next.accessToken}`;
+                if (ownsUserId && typeof body === "string") {
+                  const rebound = JSON.parse(body);
+                  const userId = await userIdFor(next.accessToken);
+                  rebound.metadata ??= {};
+                  if (userId) rebound.metadata.user_id = userId;
+                  else delete rebound.metadata.user_id;
+                  body = JSON.stringify(rebound);
+                }
                 attempt = 0;
                 console.error(`[claude-pool] now using account "${activeLabel}"`);
                 response = await doFetch();
