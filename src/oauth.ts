@@ -125,37 +125,67 @@ async function curlPost(
   };
 }
 
-export function extractOAuthErrorDetail(body: string): string {
+/** The OAuth server's error text, or null for a non-JSON (proxy/firewall) body, which is never quoted. */
+export function extractOAuthErrorDetail(body: string): string | null {
+  let parsed: {
+    error?: { message?: string; type?: string } | string;
+    error_description?: string;
+    message?: string;
+  };
   try {
-    const parsed = JSON.parse(body) as {
-      error?: { message?: string; type?: string } | string;
-      error_description?: string;
-      message?: string;
-    };
-    if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
-    if (parsed.error && typeof parsed.error === "object" && parsed.error.message?.trim()) {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const pick = (): string => {
+    if (typeof parsed?.error === "string" && parsed.error.trim()) return parsed.error.trim();
+    if (parsed?.error && typeof parsed.error === "object" && parsed.error.message?.trim()) {
       return parsed.error.message.trim();
     }
-    if (parsed.error_description?.trim()) return parsed.error_description.trim();
-    if (parsed.message?.trim()) return parsed.message.trim();
-  } catch {}
-  return body.trim();
+    if (parsed?.error_description?.trim()) return parsed.error_description.trim();
+    if (parsed?.message?.trim()) return parsed.message.trim();
+    return "unrecognised error body";
+  };
+  return pick().slice(0, 300);
 }
 
-function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
+function pageTitle(body: string): string {
+  const title = body.match(/<title[^>]*>([^<]{1,80})/i)?.[1]?.trim();
+  return title ? ` ("${title}")` : "";
+}
+
+/** Used when a response carries valid tokens but no usable lifetime: refresh again soon rather than lose them. */
+export const FALLBACK_TOKEN_LIFETIME_MS = 5 * 60_000;
+
+export function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
   if (status !== 200) {
-    throw new Error(`${label} failed (${status}): ${extractOAuthErrorDetail(body)}`);
+    const detail = extractOAuthErrorDetail(body);
+    if (detail === null) {
+      // Deliberately not "<label> failed (NNN)": that prefix marks a rejected
+      // credential, and a page that never reached the token server is not one.
+      throw new Error(
+        `${label}: HTTP ${status} with a non-JSON body${pageTitle(body)}, likely blocked before reaching the token server`,
+      );
+    }
+    throw new Error(`${label} failed (${status}): ${detail}`);
   }
-  const data = JSON.parse(body) as {
-    access_token: string;
-    refresh_token: string;
-    expires_in: number;
-  };
-  return {
-    access: data.access_token,
-    refresh: data.refresh_token,
-    expires: Date.now() + data.expires_in * 1000,
-  };
+  // Errors here must not quote the body: a 200 body is where the tokens are.
+  let data: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error(`${label} returned a malformed response (HTTP 200, ${body.length} bytes)`);
+  }
+  const { access_token: access, refresh_token: refresh, expires_in: expiresIn } = data ?? {};
+  if (typeof access !== "string" || !access || typeof refresh !== "string" || !refresh) {
+    throw new Error(`${label} returned HTTP 200 without an access and refresh token`);
+  }
+  const hasLifetime = typeof expiresIn === "number" && Number.isFinite(expiresIn) && expiresIn > 0;
+  if (!hasLifetime) {
+    console.error(`[opencode-oauth] ${label} response has no valid expires_in; treating the token as valid for 5 minutes`);
+  }
+  const lifetimeMs = hasLifetime ? expiresIn * 1000 : FALLBACK_TOKEN_LIFETIME_MS;
+  return { access, refresh, expires: Date.now() + lifetimeMs };
 }
 
 /**
