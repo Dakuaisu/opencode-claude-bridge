@@ -1158,6 +1158,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const processor = createSseProcessor({
               inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
               translateToolArgs: translateToolArgsJsonString,
+              debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
             });
 
             return new Response(
