@@ -10,6 +10,8 @@ import {
   parseClaudeCredentials,
   toAccountRecord,
   enrollFromClaudeCli,
+  labelSharingClaudeCliLogin,
+  sharedLoginWarning,
 } from "./enroll.js";
 import { createAccountStore } from "./secret-store.js";
 import type { SecretBackend } from "./types.js";
@@ -429,5 +431,34 @@ describe("automatic enrollment", () => {
 
     assert.equal(result.status, "no-label");
     assert.equal((await store.listAccounts()).length, 0);
+  });
+});
+
+describe("shared login detection", () => {
+  it("names the pooled account that holds Claude Code's current refresh token", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+
+    assert.equal(await labelSharingClaudeCliLogin(store, () => VALID_CLI_JSON), "alice");
+  });
+
+  it("reports nothing once Claude Code has its own login", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+    const separate = VALID_CLI_JSON.replace("sk-ant-ort01-xyz", "sk-ant-ort01-separate");
+
+    assert.equal(await labelSharingClaudeCliLogin(store, () => separate), null);
+  });
+
+  it("reports nothing when Claude Code is not logged in", async () => {
+    const store = createAccountStore(memoryBackend());
+    const missing = () => {
+      throw new EnrollmentError("no credentials");
+    };
+    assert.equal(await labelSharingClaudeCliLogin(store, missing), null);
+  });
+
+  it("never includes a token in the warning", () => {
+    assert.ok(!sharedLoginWarning("alice").includes("sk-ant"));
   });
 });

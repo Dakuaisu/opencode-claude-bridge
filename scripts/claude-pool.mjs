@@ -15,8 +15,16 @@
 
 import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
 import { createAccountStore, createSecretBackend } from "../dist/pool/secret-store.js";
-import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } from "../dist/pool/enroll.js";
+import {
+  enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew,
+  labelSharingClaudeCliLogin, sharedLoginWarning,
+} from "../dist/pool/enroll.js";
 import { selectNext } from "../dist/pool/selection.js";
+
+async function warnIfSharingLogin() {
+  const label = await labelSharingClaudeCliLogin(accounts);
+  if (label) console.log(`\nWarning: ${sharedLoginWarning(label)}`);
+}
 
 const accounts = createAccountStore(createSecretBackend());
 const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
@@ -69,6 +77,7 @@ async function list() {
     }
   }
   console.log("\n* = active account (mirrored into opencode's anthropic slot)");
+  await warnIfSharingLogin();
 }
 
 async function enroll(label, flags = []) {
@@ -91,6 +100,7 @@ async function enroll(label, flags = []) {
     console.log("  claude login          # as the next account");
     console.log("  claude-pool enroll    # label is derived from its email");
   }
+  await warnIfSharingLogin();
 }
 
 async function auto() {
@@ -99,6 +109,7 @@ async function auto() {
     case "enrolled":
       await state.resetHealth(result.label);
       console.log(`Enrolled "${result.label}" (${result.email}).`);
+      await warnIfSharingLogin();
       break;
     case "already-enrolled":
       console.log(`Already pooled as "${result.label}".`);
@@ -180,6 +191,7 @@ async function status() {
     for (const d of selection.disabled) console.log(`  disabled ${d}`);
   }
   console.log(`state:    ${defaultStatePath()}`);
+  await warnIfSharingLogin();
 }
 
 async function remove(label) {
