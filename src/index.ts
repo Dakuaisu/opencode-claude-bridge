@@ -836,6 +836,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   parsed.temperature = 1;
                 }
 
+                if (typeof parsed.system === "string") {
+                  parsed.system = [{ type: "text", text: parsed.system }];
+                }
                 if (!parsed.system) parsed.system = [];
                 if (Array.isArray(parsed.messages)) {
                   parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
@@ -944,8 +947,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {
+              } catch (err) {
                 ownsUserId = false;
+                console.error(
+                  `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
+                );
               }
             }
 
