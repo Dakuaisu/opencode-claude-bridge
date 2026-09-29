@@ -298,6 +298,7 @@ export function getClaudeToolsForActiveOpenCodeTools(
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+const POOL_RECHECK_MS = 30_000;
 
 function buildAuthFailureResponse(detail: string): Response {
   const message = [
@@ -705,6 +706,37 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     poolActive = false;
   }
 
+  // Enrolling the first account or removing the last must apply without a
+  // restart, but listing the keychain on every request is too slow.
+  let poolCheckedAt = Date.now();
+  let poolCheckFailing = false;
+  const currentPoolActive = async (): Promise<boolean> => {
+    if (Date.now() - poolCheckedAt < POOL_RECHECK_MS) return poolActive;
+    poolCheckedAt = Date.now();
+    try {
+      const active = await pool.isActive();
+      if (active && !poolActive) await pool.sync();
+      poolCheckFailing = false;
+      if (active !== poolActive) {
+        poolActive = active;
+        const note = active
+          ? "Accounts enrolled — rotating across the pool"
+          : "No accounts enrolled — using the single OpenCode login";
+        console.error(`[claude-pool] ${note}`);
+        toast("info", note);
+      }
+    } catch (err) {
+      // Keep the last known mode: a locked keychain must not flip it back and forth.
+      if (!poolCheckFailing) {
+        console.error(
+          `[claude-pool] could not re-check enrolled accounts; keeping pool ${poolActive ? "on" : "off"}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      poolCheckFailing = true;
+    }
+    return poolActive;
+  };
+
   // Bootstrap auth at plugin init time — before OpenCode builds its provider
   // state — so the loader runs on startup and models appear immediately
   // without requiring a restart.
@@ -758,7 +790,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         // anti-clobber reason as the init path above.
         if (auth.type !== "oauth") {
           try {
-            if (poolActive) {
+            if (await currentPoolActive()) {
               const acquired = await pool.acquire();
               if (acquired.kind === "ok") auth = await getAuth();
             } else {
@@ -799,8 +831,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // Label of the pool account serving this request, so a later
             // rate-limit response can be attributed to the right account.
             let activeLabel: string | null = null;
+            const usePool = await currentPoolActive();
 
-            if (poolActive) {
+            if (usePool) {
               let acquired: Awaited<ReturnType<typeof pool.acquire>>;
               try {
                 acquired = await pool.acquire();
@@ -1068,7 +1101,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // Only non-2xx bodies are consumed here (short JSON error
             // envelopes, never a live stream), and they are rebuilt verbatim
             // before being handed downstream.
-            if (poolActive && activeLabel && !response.ok) {
+            if (usePool && activeLabel && !response.ok) {
               const maxRotations = (await pool.listLabels()).length;
               let rotations = 0;
               let attempt = 0;
@@ -1212,12 +1245,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               }
             }
 
-            if (poolActive && activeLabel && response.ok) {
+            if (usePool && activeLabel && response.ok) {
               const served = activeLabel;
               await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served));
             }
 
-            if (!poolActive && response.status === 401) {
+            if (!usePool && response.status === 401) {
               console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
               let freshToken: string | null = null;
               try {
@@ -1237,7 +1270,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             // Legacy single-account path: refresh the token and retry, on the
             // assumption that rate limits are per-access-token.
-            if (!poolActive && response.status === 429) {
+            if (!usePool && response.status === 429) {
               for (let retry = 0; retry < 2; retry++) {
                 console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
                 let freshToken: string | null = null;
