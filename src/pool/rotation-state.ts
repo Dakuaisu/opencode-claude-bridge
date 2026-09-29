@@ -311,8 +311,12 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     const nonce = await acquire();
     try {
       const state = load();
+      // Persist only on real change. Several callers (notably token refresh)
+      // take the lock for its mutual exclusion and never touch the state, and
+      // rewriting the file for them burns an fsync on every request.
+      const before = JSON.stringify(state);
       const result = await fn(state);
-      save(state);
+      if (JSON.stringify(state) !== before) save(state);
       return result;
     } finally {
       release(nonce);
@@ -342,6 +346,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     },
 
     async ensureAccount(label: string): Promise<void> {
+      // Fast path: this runs for every account on every acquire(), and taking
+      // the cross-process lock to discover "already present" cost ~10ms each.
+      // Re-checked under the lock below, so the race is benign.
+      if (load().accounts[label]) return;
       await withLock((state) => {
         if (!state.accounts[label]) {
           state.accounts[label] = defaultAccountState(clock());
