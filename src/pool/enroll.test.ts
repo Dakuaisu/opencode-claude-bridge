@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   EnrollmentError,
+  LabelConflictError,
   deriveLabelFromEmail,
   normalizeLabel,
   autoEnrollIfNew,
@@ -230,6 +231,84 @@ describe("re-enrolling after a re-login", () => {
       (err: Error) => err instanceof EnrollmentError && /already enrolled as "alice"/.test(err.message),
     );
     assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("label collisions", () => {
+  const other = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "sk-ant-oat01-other",
+      refreshToken: "sk-ant-ort01-other",
+      expiresAt: NOW + 3_600_000,
+    },
+  });
+
+  async function storeWithAlice(email?: string) {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, email));
+    return store;
+  }
+
+  it("gives a different person who derives the same label a free suffix", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice-2");
+    assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("asks before overwriting a label whose owner's email is unknown", async () => {
+    const store = await storeWithAlice();
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.label === "alice" && err.existingEmail === null,
+    );
+    assert.equal((await store.listAccounts())[0]?.oauth.refresh, "sk-ant-ort01-xyz");
+  });
+
+  it("still refuses an explicit label that belongs to someone else", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        label: "alice",
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.existingEmail === "alice@work.io",
+    );
+  });
+
+  it("overwrites the conflicting label when replace is set", async () => {
+    const store = await storeWithAlice();
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      label: "alice",
+      replace: true,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice");
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-other");
   });
 });
 

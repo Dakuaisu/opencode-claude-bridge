@@ -13,6 +13,20 @@ const OAUTH_BETA = "oauth-2025-04-20";
 
 export class EnrollmentError extends Error {}
 
+/** The label is held by an account that may or may not be this one; only the user can decide. */
+export class LabelConflictError extends EnrollmentError {
+  constructor(
+    readonly label: string,
+    readonly existingEmail: string | null,
+  ) {
+    super(
+      existingEmail
+        ? `Label "${label}" already belongs to a different account (${existingEmail}). Choose another label or pass --replace.`
+        : `Label "${label}" belongs to an account whose email was never resolved; it may be this one. Pass --replace to overwrite it, or choose another label.`,
+    );
+  }
+}
+
 const MAX_LABEL_LENGTH = 64;
 
 /**
@@ -233,9 +247,14 @@ export async function enrollFromClaudeCli(
       && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
   );
   if (sameLabelDifferentAccount && opts.replace !== true) {
-    throw new EnrollmentError(
-      `Label "${label}" already belongs to a different account (${sameLabelDifferentAccount.email ?? "unknown email"}). Choose another label or pass --replace.`,
-    );
+    const derived = opts.label === undefined;
+    const otherPerson = Boolean(email && sameLabelDifferentAccount.email);
+    if (derived && otherPerson) {
+      // alice@work and alice@home derive the same label; both belong in the pool.
+      label = firstFreeLabel(label, existing);
+    } else {
+      throw new LabelConflictError(label, sameLabelDifferentAccount.email ?? null);
+    }
   }
 
   const record = toAccountRecord(label, creds, now, email);
