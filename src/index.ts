@@ -735,7 +735,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               }
               activeLabel = acquired.label;
               accessToken = acquired.accessToken;
-            } else if (!accessToken || !auth.expires || auth.expires < Date.now()) {
+            } else if (!accessToken || !auth.expires || auth.expires < Date.now() + 60_000) {
               try {
                 accessToken = await refreshAuth(auth, client);
               } catch (err) {
@@ -1059,6 +1059,24 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             if (poolActive && activeLabel && response.ok) {
               await pool.markSuccess(activeLabel);
+            }
+
+            if (!poolActive && response.status === 401) {
+              console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
+              let freshToken: string | null = null;
+              try {
+                freshToken = await refreshAuth(auth, client);
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.error(`[opencode-claude-bridge] OAuth refresh failed after 401: ${detail}`);
+                await response.body?.cancel();
+                return buildAuthFailureResponse(detail);
+              }
+              if (freshToken && freshToken !== accessToken) {
+                await response.body?.cancel();
+                outHeaders["authorization"] = `Bearer ${freshToken}`;
+                response = await doFetch();
+              }
             }
 
             // Legacy single-account path: refresh the token and retry, on the
