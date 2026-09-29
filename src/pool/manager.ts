@@ -49,8 +49,15 @@ import type {
 
 export type AccountStore = ReturnType<typeof createAccountStore>;
 
-/** Refresh a token pair. Sync, mirroring oauth.ts's curl-based refreshTokens. */
-export type RefreshFn = (refreshToken: string) => PoolOAuthTokens;
+/**
+ * Refresh a token pair.
+ *
+ * May be sync or async. Prefer async: a synchronous refresh blocks the event
+ * loop for the whole round trip, stalling every session in the process.
+ */
+export type RefreshFn = (
+  refreshToken: string,
+) => PoolOAuthTokens | Promise<PoolOAuthTokens>;
 
 /** Mirror the active account into opencode's single `anthropic` auth slot. */
 export type MirrorFn = (tokens: PoolOAuthTokens) => Promise<void>;
@@ -249,7 +256,7 @@ export function createRotationManager(opts: ManagerOptions) {
         if (!current) throw new Error(`Account "${label}" is not enrolled`);
         if (isFresh(current.oauth, clock())) return current.oauth;
 
-        const fresh = refreshFn(current.oauth.refresh);
+        const fresh = await refreshFn(current.oauth.refresh);
 
         // Journal BEFORE committing: the server has already invalidated the
         // old refresh token, so these are now the only usable credentials.

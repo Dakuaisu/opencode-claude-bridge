@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import {
   CLIENT_ID,
   TOKEN_URL,
@@ -37,13 +37,14 @@ function base64url(buf: Buffer): string {
   return buf.toString("base64url").replace(/=+$/, "");
 }
 
-function sleep(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function buildTokenCurlArgs(payload: string): string[] {
+// Payload (tokens, PKCE verifier) goes over stdin: argv is visible to `ps`.
+export function buildTokenCurlArgs(): string[] {
   return [
-    "-s",
+    "-sS",
     "-w",
     "\n__HTTP_STATUS__%{http_code}",
     "-X",
@@ -53,32 +54,51 @@ export function buildTokenCurlArgs(payload: string): string[] {
     "Content-Type: application/json",
     "-H",
     `User-Agent: ${USER_AGENT}`,
-    "-d",
-    payload,
+    "--data-binary",
+    "@-",
   ];
+}
+
+// execFile's error message embeds the command line; never rethrow it raw.
+function describeCurlFailure(err: unknown): string {
+  const e = err as { code?: string | number; killed?: boolean; signal?: string | null; stderr?: unknown };
+  if (e.code === "ENOENT") return "curl is not installed or not on PATH";
+  if (e.killed || e.signal === "SIGTERM") return "request timed out";
+  const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
+  if (typeof e.code === "number") return `curl exited ${e.code}${stderr ? `: ${stderr}` : ""}`;
+  return typeof e.code === "string" ? e.code : "unknown curl failure";
+}
+
+// Async on purpose: a synchronous child process blocks the event loop, which
+// stalls every stream in the long-lived opencode server for the whole refresh.
+function runCurl(payload: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "curl",
+      buildTokenCurlArgs(),
+      { timeout: 30000, encoding: "utf8", maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => (error ? reject(Object.assign(error, { stderr })) : resolve(stdout)),
+    );
+    // curl can exit (DNS/TLS failure) before reading stdin; an unhandled EPIPE
+    // would crash the whole opencode process. The exit callback reports it.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(payload);
+  });
 }
 
 /**
  * curl-based token exchange to avoid Bun/runtime fetch injecting
  * forbidden headers (Origin, Referer, Sec-Fetch-*) that trigger 429s.
  */
-function curlPost(
+async function curlPost(
   body: Record<string, string>,
   retries = 3,
-): { status: number; body: string } {
+): Promise<{ status: number; body: string }> {
   const payload = JSON.stringify(body);
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const result = execFileSync(
-        "curl",
-        buildTokenCurlArgs(payload),
-        {
-          timeout: 30000,
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+      const result = await runCurl(payload);
 
       const parts = result.split("\n__HTTP_STATUS__");
       const status = parseInt(parts[parts.length - 1], 10);
@@ -92,9 +112,11 @@ function curlPost(
         `[opencode-oauth] Token endpoint 429 (attempt ${attempt + 1}/${retries}), retrying...`,
       );
     } catch (err) {
-      if (attempt === retries - 1) throw err;
+      if (attempt === retries - 1) {
+        throw new Error(`Token endpoint unreachable: ${describeCurlFailure(err)}`);
+      }
     }
-    sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000);
+    await sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000);
   }
 
   return {
@@ -304,12 +326,12 @@ export function parseAuthCode(raw: string): string {
   return code.trim();
 }
 
-export function exchangeCodeForTokens(
+export async function exchangeCodeForTokens(
   code: string,
   verifier: string,
   redirectUri?: string,
-): OAuthTokens {
-  const { status, body } = curlPost({
+): Promise<OAuthTokens> {
+  const { status, body } = await curlPost({
     grant_type: "authorization_code",
     code,
     code_verifier: verifier,
@@ -319,8 +341,8 @@ export function exchangeCodeForTokens(
   return parseTokenResponse(status, body, "Token exchange");
 }
 
-export function refreshTokens(refreshToken: string): OAuthTokens {
-  const { status, body } = curlPost({
+export async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
+  const { status, body } = await curlPost({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
