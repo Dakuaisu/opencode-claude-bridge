@@ -116,6 +116,8 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   ExitPlanMode: "plan_exit",
 };
 
+// Fallback catalog, used only for ids the host's own model list lacks.
+// Prices per million tokens, from platform.claude.com/docs/en/about-claude/pricing.
 const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
   "claude-fable-5-1": {
     name: "Claude Fable 5.1",
@@ -143,14 +145,14 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-opus-4-5": {
     name: "Claude Opus 4.5",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-sonnet-4-6": {
     name: "Claude Sonnet 4.6",
@@ -169,9 +171,9 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
   "claude-haiku-4-5-20251001": {
     name: "Claude Haiku 4.5",
     attachment: true, reasoning: false, tool_call: true, temperature: true,
-    limit: { context: 200000, output: 8192 },
+    limit: { context: 200000, output: 64000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 0.8, output: 4, cache_read: 0.08, cache_write: 1 },
+    cost: { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
   },
 };
 
