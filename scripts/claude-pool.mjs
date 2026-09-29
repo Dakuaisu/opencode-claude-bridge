@@ -55,8 +55,10 @@ async function list() {
     return;
   }
   const s = state.load();
+  const labelWidth = Math.max(9, ...records.map((r) => r.label.length)) + 2;
+  const emailWidth = Math.max(5, ...records.map((r) => (r.email ?? "?").length)) + 2;
   console.log(
-    `${"LABEL".padEnd(10)}${"EMAIL".padEnd(30)}${"TIER".padEnd(10)}${"STATUS".padEnd(12)}TOKEN EXPIRES`,
+    ` ${"LABEL".padEnd(labelWidth)}${"EMAIL".padEnd(emailWidth)}${"TIER".padEnd(10)}${"STATUS".padEnd(12)}TOKEN EXPIRES`,
   );
   for (const r of records.sort((a, b) => a.label.localeCompare(b.label))) {
     const st = s.accounts[r.label];
@@ -67,13 +69,13 @@ async function list() {
         ? "COOLING"
         : "ready";
     console.log(
-      `${active}${r.label.padEnd(9)}${(r.email ?? "?").padEnd(30)}${(r.subscriptionType ?? "?").padEnd(10)}${status.padEnd(12)}${new Date(r.oauth.expires).toISOString()}`,
+      `${active}${r.label.padEnd(labelWidth)}${(r.email ?? "?").padEnd(emailWidth)}${(r.subscriptionType ?? "?").padEnd(10)}${status.padEnd(12)}${new Date(r.oauth.expires).toISOString()}`,
     );
     if (st?.cooldownUntil && st.cooldownUntil > Date.now()) {
-      console.log(`${" ".repeat(10)}cooling until ${when(st.cooldownUntil)} — ${st.lastReason ?? ""}`);
+      console.log(`${" ".repeat(labelWidth + 1)}cooling until ${when(st.cooldownUntil)} — ${st.lastReason ?? ""}`);
     }
     if (st?.disabled) {
-      console.log(`${" ".repeat(10)}disabled — ${st.lastReason ?? ""}`);
+      console.log(`${" ".repeat(labelWidth + 1)}disabled — ${st.lastReason ?? ""}`);
     }
   }
   console.log("\n* = active account (mirrored into opencode's anthropic slot)");
