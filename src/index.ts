@@ -433,6 +433,21 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
   }
 }
 
+function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Build deduplicated beta flags string. */
 function buildBetaFlags(existing: string): string {
   // Dropping caller flags makes the API reject newer body fields they gate.
@@ -1014,7 +1029,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
                   );
-                  await new Promise((r) => setTimeout(r, decision.backoffMs ?? 1000));
+                  await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
                   response = await doFetch();
                   if (response.ok) break;
                   continue;
@@ -1098,7 +1113,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
                 // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+                await abortableSleep(1000 * (retry + 1), init?.signal);
+                await response.body?.cancel();
                 response = await doFetch();
                 if (response.status !== 429) break;
               }
@@ -1147,6 +1163,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       controller.error(e);
                     }
                   })();
+                },
+                cancel(reason) {
+                  return reader.cancel(reason);
                 },
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },
