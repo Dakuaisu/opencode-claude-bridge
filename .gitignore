@@ -1,6 +1,10 @@
 node_modules/
 dist/
 tmp/
+.DS_Store
 
 # Serena agent workspace (local tooling state)
 .serena/
+
+# OpenCode agent session state
+.omo/
