@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const CLAUDE_BINARIES = [
   "claude",
@@ -150,6 +151,24 @@ export const POOL_TOAST_DURATION_MS = 10_000;
 export const POOL_COMMAND_NAME = "claude-pool";
 
 /**
+ * Absolute path to the pool CLI, resolved from this module's own location.
+ *
+ * This file compiles to `dist/constants.js`, so `../scripts/` points at the
+ * package root's scripts directory — whether that is a source checkout, an
+ * npm install under `~/.cache/opencode/node_modules`, or anything else.
+ * npm always ships `bin` targets (`scripts/claude-pool.mjs`), so the script
+ * exists wherever the package is installed; no `$HOME/src/...` assumption.
+ */
+export const CLAUDE_POOL_SCRIPT = fileURLToPath(
+  new URL("../scripts/claude-pool.mjs", import.meta.url),
+);
+
+/** Single-quote a path for `sh -c` so spaces and metacharacters survive. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
  * Template for {@link POOL_COMMAND_NAME}.
  *
  * The !`...` form is expanded by opencode itself: it runs the command and
@@ -160,8 +179,7 @@ export const POOL_COMMAND_NAME = "claude-pool";
  * the block and stops.
  */
 export const POOL_COMMAND_TEMPLATE = [
-  "!`node " +
-    "$HOME/src/opencode-claude-bridge/scripts/claude-pool.mjs dashboard`",
+  "!`node " + shellQuote(CLAUDE_POOL_SCRIPT) + " dashboard`",
   "",
   "Output the block above verbatim inside a fenced code block. " +
     "Add no commentary, summary, or follow-up question.",
